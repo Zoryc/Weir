@@ -14,7 +14,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QProcess, Signal
 
 from .deps import DepsManager
-from .errors import FriendlyError, explain_error
+from .errors import ATTEMPT_PREFIX, FriendlyError, explain_error
 from .presets import Preset, is_audio_only
 from .process import configure_process, kill_process_tree, qprocess_environment
 
@@ -43,6 +43,15 @@ CONVERT_PREFIXES: tuple[str, ...] = (
 TRIVIAL_POSTPROCESSORS = {"MoveFiles", "MoveFilesAfterDownload"}
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 LOG_LINES_PER_JOB = 400
+# DownloadOptions.cookies_browser may hold "file:<path to cookies.txt>" instead of a browser name.
+COOKIES_FILE_PREFIX = "file:"
+# Audio/video file extensions. A finished download leaves such a file behind only as one of its
+# outputs (reported by [FILE]), unless it was told to keep its intermediate files.
+MEDIA_EXTENSIONS = frozenset({
+    "3gp", "aac", "aiff", "alac", "avi", "flac", "flv", "m4a", "m4v", "mka", "mkv", "mov",
+    "mp3", "mp4", "oga", "ogg", "opus", "ts", "wav", "weba", "webm",
+})
+KEEP_INTERMEDIATE_ARGS = frozenset({"-k", "--keep-video"})
 
 
 class JobStatus(str, Enum):
@@ -75,6 +84,48 @@ class _Destination:
     directory: str
     stem: str
     existing: frozenset[str]  # files with this stem that existed before we started
+
+
+@dataclass(frozen=True)
+class _Protected:
+    """Files of another download that a cancel cleanup must leave alone."""
+
+    job_id: int
+    directory: str  # normalised with _norm_path
+    stem: str  # os.path.normcase'd file name stem, e.g. "title [id]"
+    partials: bool  # also keep .part/.ytdl/temp files (that download may still need them)
+    # Also keep audio/video files. False for a finished download: its media files are its [FILE]
+    # outputs (kept by exact path), so other media files with its name are the cancelled one's.
+    media: bool = True
+
+    def covers(self, directory: str, name: str, partial: bool) -> bool:
+        if partial and not self.partials:
+            return False
+        if not partial and not self.media and _is_media(name):
+            return False
+        return directory == self.directory and os.path.normcase(name).startswith(self.stem + ".")
+
+
+@dataclass(eq=False)
+class _CleanupTask:
+    """One cancel cleanup: prepared on the UI thread, run on a worker thread."""
+
+    job_id: int
+    destinations: list[_Destination]
+    finals: list[str]  # normalised paths of the files the cancelled download finished
+    protected: list[_Protected]  # other downloads' files when the cleanup started
+    protected_paths: dict[str, int]  # normalised path -> id of the download that finished it
+    _late: list[_Protected] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def claim(self, item: _Protected) -> None:
+        """A download announced a file name while this cleanup runs (called on the UI thread)."""
+        with self._lock:
+            self._late.append(item)
+
+    def late_owner(self, directory: str, name: str, partial: bool) -> int | None:
+        with self._lock:
+            return next((p.job_id for p in self._late if p.covers(directory, name, partial)), None)
 
 
 @dataclass
@@ -157,7 +208,11 @@ def build_arguments(job: DownloadJob, deps: DepsManager) -> list[str]:
         args += ["--embed-subs", "--sub-langs", SUB_LANGS]
     if opts.embed_meta:
         args += ["--embed-thumbnail", "--embed-metadata"]
-    if opts.cookies_browser:
+    if opts.cookies_browser.startswith(COOKIES_FILE_PREFIX):
+        cookies_file = opts.cookies_browser[len(COOKIES_FILE_PREFIX):].strip()
+        if cookies_file:
+            args += ["--cookies", cookies_file]
+    elif opts.cookies_browser:
         args += ["--cookies-from-browser", opts.cookies_browser]
     if opts.rate_limit:
         args += ["--limit-rate", opts.rate_limit]
@@ -184,6 +239,91 @@ def _parse_percent(text: str) -> float | None:
         return None
 
 
+def _norm_url(url: str) -> str:
+    return url.strip().rstrip("/")
+
+
+def _norm_path(path: str, base: str = "") -> str:
+    """Absolute, case-normalised path (relative paths are taken relative to base)."""
+    p = Path(path)
+    if base and not p.is_absolute():
+        p = Path(base) / p
+    return os.path.normcase(os.path.abspath(p))
+
+
+def _is_partial(suffix: str) -> bool:
+    """True for yt-dlp's unfinished files, given the part of the name after the stem."""
+    return suffix.endswith((".part", ".ytdl")) or ".part-Frag" in suffix or suffix.startswith(".temp.")
+
+
+def _is_media(name: str) -> bool:
+    return Path(name).suffix.lower().lstrip(".") in MEDIA_EXTENSIONS
+
+
+def _keeps_intermediates(job: DownloadJob) -> bool:
+    """True if yt-dlp was told to keep the files it converts or merges (-k)."""
+    return any(arg in KEEP_INTERMEDIATE_ARGS for arg in [*job.preset.args, *job.options.extra_args])
+
+
+def _cookie_source_for_errors(cookies_browser: str) -> str:
+    """The cookie source as explain_error expects it: a browser name or a cookies.txt path."""
+    if cookies_browser.startswith(COOKIES_FILE_PREFIX):
+        return cookies_browser[len(COOKIES_FILE_PREFIX):].strip()
+    return cookies_browser
+
+
+def _remove_unfinished(task: _CleanupTask) -> tuple[int, list[int]]:
+    """Delete what a cancelled download left behind. Runs off the UI thread.
+
+    Only files named after one of this download's destinations are looked at. Partial files
+    are deleted; other files only if they did not exist when the item started and the item
+    did not finish. Files that belong to another download (protected, or announced by one
+    while the cleanup runs) are always kept.
+    Returns the number of files removed and the ids of the downloads whose files were kept.
+    """
+    final_paths = {_norm_path(f) for f in task.finals}
+    finished_stems = {os.path.normcase(Path(f).stem) for f in task.finals}
+    removed = 0
+    kept_for: set[int] = set()
+    for dest in task.destinations:
+        try:
+            names = os.listdir(dest.directory)
+        except OSError:
+            continue
+        directory = _norm_path(dest.directory)
+        for name in names:
+            if not name.startswith(dest.stem + "."):
+                continue
+            full = os.path.join(dest.directory, name)
+            key = _norm_path(full)
+            if key in final_paths:
+                continue
+            partial = _is_partial(name[len(dest.stem):])
+            if not partial and (name in dest.existing or os.path.normcase(dest.stem) in finished_stems):
+                continue
+            owner = task.protected_paths.get(key)
+            if owner is None:
+                owner = next((p.job_id for p in task.protected if p.covers(directory, name, partial)), None)
+            if owner is not None:
+                kept_for.add(owner)
+                continue
+            for _attempt in range(10):
+                # Checked right before each try: a download may have started meanwhile.
+                owner = task.late_owner(directory, name, partial)
+                if owner is not None:
+                    kept_for.add(owner)
+                    break
+                try:
+                    os.remove(full)
+                    removed += 1
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    time.sleep(0.5)  # Windows: the killed process may still hold the file
+    return removed, sorted(kept_for)
+
+
 class DownloadManager(QObject):
     """Owns the queue. All QProcess work happens on the UI thread, asynchronously."""
 
@@ -194,7 +334,7 @@ class DownloadManager(QObject):
     job_failed = Signal(int)
     queue_finished = Signal(int, int, int)  # done, failed, cancelled since the queue was last idle
     stopped = Signal()  # nothing running and no cleanup pending
-    _cleanup_done = Signal(int, int)
+    _cleanup_done = Signal(object, int, object)  # _CleanupTask, files removed, ids of downloads whose files were kept
 
     def __init__(self, deps: DepsManager, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -205,6 +345,10 @@ class DownloadManager(QObject):
         self._batch_counts = [0, 0, 0]
         self._batch_active = False
         self._pending_cleanups = 0
+        self._cleanups: list[_CleanupTask] = []
+        # Every file a download finished: normalised path -> (job id, kept intermediates).
+        # Outlives the job (Clear finished, Remove, Retry) so a cancel can't delete it later.
+        self._finished_files: dict[str, tuple[int, bool]] = {}
         self._cleanup_done.connect(self._on_cleanup_done)
 
     # -- queries ------------------------------------------------------------
@@ -226,6 +370,24 @@ class DownloadManager(QObject):
 
     def is_idle(self) -> bool:
         return self.running_count() == 0 and self._pending_cleanups == 0
+
+    def find_active(self, url: str, save_dir: str, preset: Preset | None = None) -> int | None:
+        """Id of a waiting or running download of the same link into the same folder, if any.
+
+        With a preset, only downloads with the same yt-dlp options count: the same video
+        as MP4 and as MP3 is fine (they take turns, see _target_busy).
+        """
+        wanted_url = _norm_url(url)
+        wanted_dir = _norm_path(save_dir)
+        for job in self._jobs.values():
+            running = job.process is not None and not job.cancel_requested
+            if job.status != JobStatus.WAITING and not running:
+                continue
+            if preset is not None and job.preset.args != preset.args:
+                continue
+            if _norm_url(job.url) == wanted_url and _norm_path(job.options.save_dir) == wanted_dir:
+                return job.id
+        return None
 
     # -- commands -----------------------------------------------------------
 
@@ -294,8 +456,24 @@ class DownloadManager(QObject):
         for job in list(self._jobs.values()):
             if self.running_count() >= self._max_parallel:
                 break
-            if job.status == JobStatus.WAITING and job.process is None:
+            if job.status == JobStatus.WAITING and job.process is None and not self._target_busy(job):
                 self._start(job)
+
+    def _target_busy(self, job: DownloadJob) -> bool:
+        """True while another download of the same link into the same folder runs.
+
+        Two presets of one video (MP4 and MP3, say) download the same streams under the
+        same temporary names, so the second one waits for the first to finish.
+        """
+        url = _norm_url(job.url)
+        folder = _norm_path(job.options.save_dir)
+        return any(
+            other is not job
+            and other.process is not None
+            and _norm_url(other.url) == url
+            and _norm_path(other.options.save_dir) == folder
+            for other in self._jobs.values()
+        )
 
     def _start(self, job: DownloadJob) -> None:
         ytdlp = self._deps.tool("yt-dlp")
@@ -343,7 +521,7 @@ class DownloadManager(QObject):
         proc.errorOccurred.connect(lambda err: self._on_process_error(job_id, err))
         job.process = proc
 
-        self._log(job, "▶ " + _format_command(ytdlp.path.name, args))
+        self._log(job, f"{ATTEMPT_PREFIX} " + _format_command(ytdlp.path.name, args))
         self.job_changed.emit(job.id)
         proc.start()
 
@@ -396,8 +574,11 @@ class DownloadManager(QObject):
             return True
         if line.startswith("[FILE]"):
             path = line[len("[FILE]"):].strip()
-            if path and path not in job.files:
-                job.files.append(path)
+            if path:
+                if path not in job.files:
+                    job.files.append(path)
+                full = _norm_path(path, job.options.save_dir)
+                self._finished_files[full] = (job.id, _keeps_intermediates(job))
             job.percent = 100.0
             return True
         if line.startswith("[PP]"):
@@ -431,6 +612,12 @@ class DownloadManager(QObject):
         except OSError:
             existing = frozenset()
         job._destinations.append(_Destination(directory, stem, existing))
+        if self._cleanups:
+            # Cleanups already running must leave this download's files alone, too (this
+            # includes a cleanup for an earlier run of this same job, now retried).
+            claim = _Protected(job.id, _norm_path(directory), os.path.normcase(stem), partials=True)
+            for task in self._cleanups:
+                task.claim(claim)
 
     def _log(self, job: DownloadJob, line: str) -> None:
         job.log.append(line)
@@ -496,7 +683,7 @@ class DownloadManager(QObject):
             job.error = explain_error(
                 list(job.log),
                 has_js_runtime=job.used_js_runtime,
-                cookies_browser=job.options.cookies_browser,
+                cookies_browser=_cookie_source_for_errors(job.options.cookies_browser),
             )
         self._count(job)
         self.job_changed.emit(job.id)
@@ -525,59 +712,105 @@ class DownloadManager(QObject):
     # -- partial-file cleanup after cancel ---------------------------------
 
     def _start_cleanup(self, job: DownloadJob) -> None:
-        destinations = list(job._destinations)
-        finals = list(job.files)
-        if not destinations:
+        task = self._prepare_cleanup(job)
+        if task is None:
             return
-        self._pending_cleanups += 1
         thread = threading.Thread(
             target=self._cleanup_worker,
-            args=(job.id, destinations, finals),
+            args=(task,),
             name=f"cleanup-{job.id}",
             daemon=True,
         )
         thread.start()
 
-    def _cleanup_worker(self, job_id: int, destinations: list[_Destination], finals: list[str]) -> None:
-        """Delete .part/.ytdl/temp files (and files created by the cancelled item)."""
-        final_paths = {os.path.normcase(os.path.abspath(f)) for f in finals}
-        finished_stems = {Path(f).stem for f in finals}
-        removed = 0
-        for dest in destinations:
-            try:
-                names = os.listdir(dest.directory)
-            except OSError:
-                continue
-            for name in names:
-                if not name.startswith(dest.stem + "."):
-                    continue
-                full = os.path.join(dest.directory, name)
-                if os.path.normcase(os.path.abspath(full)) in final_paths:
-                    continue
-                suffix = name[len(dest.stem):]
-                is_partial = (
-                    suffix.endswith((".part", ".ytdl"))
-                    or ".part-Frag" in suffix
-                    or suffix.startswith(".temp.")
-                )
-                if not is_partial and (name in dest.existing or dest.stem in finished_stems):
-                    continue
-                for _attempt in range(10):
-                    try:
-                        os.remove(full)
-                        removed += 1
-                        break
-                    except FileNotFoundError:
-                        break
-                    except OSError:
-                        time.sleep(0.5)  # Windows: the killed process may still hold the file
-        self._cleanup_done.emit(job_id, removed)
+    def _prepare_cleanup(self, job: DownloadJob) -> _CleanupTask | None:
+        """Snapshot what the cleanup for `job` may look at and what it must keep (UI thread)."""
+        if not job._destinations:
+            return None
+        protected, protected_paths = self._protected_files(job)
+        task = _CleanupTask(
+            job.id,
+            list(job._destinations),
+            [_norm_path(f, job.options.save_dir) for f in job.files],
+            protected,
+            protected_paths,
+        )
+        self._cleanups.append(task)
+        self._pending_cleanups += 1
+        return task
 
-    def _on_cleanup_done(self, job_id: int, removed: int) -> None:
+    def _protected_files(self, job: DownloadJob) -> tuple[list[_Protected], dict[str, int]]:
+        """What other downloads own, so cancelling `job` can't delete it (e.g. the MP3 and the
+        MP4 of the same link share the "Title [id]" file name)."""
+        directories = {_norm_path(dest.directory) for dest in job._destinations}
+        protected: dict[_Protected, None] = {}  # ordered set
+        paths: dict[str, int] = {}
+
+        def keep_finished(full: str, owner: int, keeps_intermediates: bool) -> None:
+            directory = os.path.dirname(full)
+            if directory not in directories:
+                return
+            paths.setdefault(full, owner)
+            # Keep its side files (thumbnail, subtitles…) too. Other media files with that name
+            # are the cancelled download's leftovers.
+            item = _Protected(owner, directory, Path(full).stem, partials=False, media=keeps_intermediates)
+            protected[item] = None
+
+        # Includes downloads no longer in the list (Clear finished, Remove) or retried since.
+        for full, (owner, keeps_intermediates) in self._finished_files.items():
+            if owner != job.id:
+                keep_finished(full, owner, keeps_intermediates)
+        for other in self._jobs.values():
+            if other.id == job.id:
+                continue
+            keeps_intermediates = _keeps_intermediates(other)
+            for f in other.files:
+                keep_finished(_norm_path(f, other.options.save_dir), other.id, keeps_intermediates)
+            if other.status == JobStatus.CANCELLED:
+                continue  # it cleans up after itself; only its finished files are kept
+            running = other.process is not None
+            # A running download (even one being cancelled) may still write its partial files,
+            # and a failed one can resume from them on Retry. A finished one has listed its
+            # media files with [FILE].
+            keep_partials = running or other.status == JobStatus.ERROR
+            done = other.status == JobStatus.DONE and not running
+            for dest in other._destinations:
+                directory = _norm_path(dest.directory)
+                if directory not in directories:
+                    continue
+                item = _Protected(
+                    other.id,
+                    directory,
+                    os.path.normcase(dest.stem),
+                    partials=keep_partials,
+                    media=keeps_intermediates or not done,
+                )
+                protected[item] = None
+        return list(protected), paths
+
+    def _cleanup_worker(self, task: _CleanupTask) -> None:
+        """Delete .part/.ytdl/temp files (and files created by the cancelled item)."""
+        removed: int = 0
+        kept_for: list[int] = []
+        try:
+            removed, kept_for = _remove_unfinished(task)
+        finally:
+            self._cleanup_done.emit(task, removed, kept_for)
+
+    def _on_cleanup_done(self, task: _CleanupTask, removed: int, kept_for: object) -> None:
         self._pending_cleanups = max(0, self._pending_cleanups - 1)
-        job = self._jobs.get(job_id)
-        if job is not None and removed:
-            self._log(job, f"Removed {removed} unfinished file(s).")
+        if task in self._cleanups:
+            self._cleanups.remove(task)
+        job = self._jobs.get(task.job_id)
+        if job is not None:
+            if removed:
+                self._log(job, f"Removed {removed} unfinished file(s).")
+            for other_id in kept_for if isinstance(kept_for, list) else []:
+                if other_id == job.id:
+                    continue  # this download was retried while its old files were cleaned up
+                other = self._jobs.get(other_id)
+                name = f" (“{other.display_title}”)" if other is not None else ""
+                self._log(job, f"Kept files shared with download #{other_id}{name}.")
         if self.is_idle():
             self.stopped.emit()
 

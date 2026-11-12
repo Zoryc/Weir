@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+Fixes and smoother first steps.
+
+- Your first download: if the tools are missing, one question installs them all, and your links
+  start by themselves once they're ready. The setup window shows each tool's progress instead of
+  a red cross while it is being checked.
+- Clearer error messages: the advice now matches what actually went wrong (a file name that's
+  too long, a file in use, a full disk, an outdated yt-dlp, a failed conversion), and a retried
+  download is explained by its latest attempt only.
+- Cookies: the list shows only the browsers installed on your computer, and you can use a
+  cookies.txt file instead. "Use browser cookies" never suggests a browser that can't work.
+- The same video can be downloaded with two presets at once (say MP4 and MP3); they take turns.
+  The same link with the same preset isn't added twice.
+- Cancelling a download never deletes another download's files, and no longer shows an error
+  on Linux.
+- Tools are only installed if their checksum matches, and Weir checks for free disk space first.
+- On small laptop screens, new downloads and error messages scroll into view.
+- Opening Weir again brings the open window to the front and hands it your links.
+
 ## 1.0.0 — 2026-11-12
 
 First release.

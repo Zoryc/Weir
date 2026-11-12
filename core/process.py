@@ -9,11 +9,15 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+import shiboken6
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer
 
 from .paths import IS_WINDOWS, bin_dirs
 
 CREATE_NO_WINDOW = 0x08000000
+# How long a stopped program gets to exit on its own before it is forced to.
+HARD_KILL_DELAY_MS = 2000  # Linux: SIGTERM first, then SIGKILL
+WINDOWS_FALLBACK_DELAY_MS = 4000  # Windows: QProcess.kill() if taskkill did not work
 
 
 def child_environment(extra_dirs: Iterable[Path] | None = None) -> dict[str, str]:
@@ -136,13 +140,28 @@ def _signal_group(pid: int, sig: int) -> None:
         pass
 
 
+def _start_time(pid: int) -> str | None:
+    """Start time of pid from /proc (None if it is gone or /proc is unavailable)."""
+    fields = _read_stat(pid)
+    return fields[19] if fields is not None else None
+
+
+def _is_running(proc: QProcess) -> bool:
+    """True while proc's Qt object still exists and its program has not finished.
+
+    The downloader deleteLater()s a QProcess as soon as it finishes, so code that
+    runs later (timers, signals) must check this before touching proc.
+    """
+    return shiboken6.isValid(proc) and proc.state() != QProcess.ProcessState.NotRunning
+
+
 def kill_process_tree(proc: QProcess, owner: QObject) -> None:
     """Stop a process and everything it started (yt-dlp + ffmpeg/deno children).
 
     Non-blocking: on Windows taskkill runs as its own QProcess; on Linux the
     process group (or the /proc tree) gets SIGTERM, then SIGKILL if needed.
     """
-    if proc.state() == QProcess.ProcessState.NotRunning:
+    if not _is_running(proc):
         return
     pid = int(proc.processId())
     if pid <= 0:
@@ -152,20 +171,28 @@ def kill_process_tree(proc: QProcess, owner: QObject) -> None:
         killer = QProcess(owner)
         configure_process(killer)
         killer.finished.connect(killer.deleteLater)
-        killer.errorOccurred.connect(lambda _err: proc.kill())
+
+        def _kill_directly(_error: QProcess.ProcessError) -> None:
+            if _is_running(proc):
+                proc.kill()
+
+        killer.errorOccurred.connect(_kill_directly)
         killer.start("taskkill", ["/PID", str(pid), "/T", "/F"])
 
         def _fallback() -> None:
-            if proc.state() != QProcess.ProcessState.NotRunning:
+            # proc is the timer's context, so Qt drops the timer once proc is
+            # deleted; the check also covers bindings that do not.
+            if _is_running(proc):
                 proc.kill()
 
-        QTimer.singleShot(4000, proc, _fallback)
+        QTimer.singleShot(WINDOWS_FALLBACK_DELAY_MS, proc, _fallback)
         return
 
     # Collect the tree first: once the parent dies, its children get re-parented.
     # The process runs in its own session when the Qt binding allows it, so the
     # group signal covers everything; the explicit tree walk covers the rest.
     descendants = _linux_descendants(pid)
+    leader_start = _start_time(pid)
     _signal_group(pid, signal.SIGTERM)
     for child, start_time in descendants.items():
         _signal_if_same(child, start_time, signal.SIGTERM)
@@ -174,11 +201,23 @@ def kill_process_tree(proc: QProcess, owner: QObject) -> None:
     def _hard_kill() -> None:
         for child, start_time in descendants.items():
             _signal_if_same(child, start_time, signal.SIGKILL)
-        if proc.state() != QProcess.ProcessState.NotRunning:
+        # Usually the program has exited after SIGTERM and the downloader has
+        # already deleted proc, so only touch proc while it still exists, and
+        # judge whether the program is still alive from its PID and start time
+        # (a PID can be reused once the program is gone).
+        running = _is_running(proc)
+        if leader_start is not None:
+            alive = _start_time(pid) == leader_start
+        else:
+            alive = running  # no /proc to look at: trust Qt
+        if alive:
             _signal_group(pid, signal.SIGKILL)
+        if running:
             proc.kill()
+        elif alive and leader_start is not None:
+            _signal_if_same(pid, leader_start, signal.SIGKILL)
 
-    QTimer.singleShot(2000, owner, _hard_kill)
+    QTimer.singleShot(HARD_KILL_DELAY_MS, owner, _hard_kill)
 
 
 def run_quiet(args: list[str], timeout: float = 60.0) -> tuple[int, str]:

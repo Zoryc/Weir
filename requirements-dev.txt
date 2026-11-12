@@ -1,0 +1,4 @@
+# Development tools (not needed to run Weir)
+-r requirements.txt
+pytest>=8
+pyflakes>=3

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import html
+import os
 import re
+from pathlib import Path
 
 from PySide6.QtCore import (
+    QDir,
     QMimeData,
     QModelIndex,
     QPersistentModelIndex,
@@ -27,11 +30,13 @@ from PySide6.QtGui import (
     QKeyEvent,
     QPainter,
     QPaintEvent,
+    QWheelEvent,
 )
 from PySide6.QtGui import QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -47,12 +52,27 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.settings import COOKIE_BROWSERS, DEFAULT_TEMPLATE
+from core.browsers import (
+    COOKIES_FILE_PREFIX,
+    browser_label,
+    cookies_file_path,
+    cookies_locked,
+    installed_browsers,
+    is_cookies_file,
+    is_network_path,
+)
+from core.paths import default_download_dir
+from core.settings import DEFAULT_TEMPLATE
 
 from . import theme
 from .icon import glyph_icon, glyph_pixmap
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+# Combo data of the "cookies.txt file…" entry, which opens a file dialog. Never a setting.
+CHOOSE_COOKIES_FILE = "<choose cookies file>"
+NOT_FOUND = " (not found)"
+COOKIES_FILE_LABEL_CHARS = 24  # keeps the list about as wide as "Chromium (not found)"
 
 PROGRESS_ROLE = Qt.ItemDataRole.UserRole  # int percent, or None for "no bar"
 ACCENT_ROLE = Qt.ItemDataRole.UserRole + 2  # QColor for the bar / status pill
@@ -453,8 +473,47 @@ class ErrorBanner(QFrame):
             signal.emit(self._job_id)
 
 
+def _elide_middle(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    keep = limit - 1
+    return text[: (keep + 1) // 2] + "…" + text[len(text) - keep // 2:]
+
+
+class CookiesCombo(QComboBox):
+    """The "Cookies from" list. Tells a pick from the open list apart from stepping with the
+    mouse wheel or the arrow keys (`stepping`), and lets the page scroll when the wheel is
+    turned over it without it having the focus."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.stepping = False
+        # The wheel no longer focuses it, so scrolling the page past it doesn't change it.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if not self.hasFocus():
+            event.ignore()  # scroll the page instead
+            return
+        self.stepping = True
+        try:
+            super().wheelEvent(event)
+        finally:
+            self.stepping = False
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        self.stepping = True
+        try:
+            super().keyPressEvent(event)
+        finally:
+            self.stepping = False
+
+
 class AdvancedPanel(QWidget):
     """The “Advanced options” controls: labels on the left, fields on the right."""
+
+    # The cookie source changed: "" (none), a browser key or "file:<path to cookies.txt>".
+    cookies_changed = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -469,10 +528,16 @@ class AdvancedPanel(QWidget):
         )
         self.template_reset_btn = QPushButton("Reset", self)
         self.template_reset_btn.setObjectName("flat")
-        self.cookies_combo = QComboBox(self)
-        for key, label in COOKIE_BROWSERS:
-            self.cookies_combo.addItem(label, key)
+        # None, the browsers found on this computer, then cookies.txt files.
+        self.cookies_combo = CookiesCombo(self)
+        self.cookies_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.cookies_combo.setMinimumWidth(130)
+        self._browsers: list[tuple[str, str]] = []
+        self._cookie_value = ""
+        self._cookies_file = ""  # the last cookies.txt chosen stays in the list
+        self.cookies_combo.currentIndexChanged.connect(self._on_cookies_index_changed)
+        self.cookies_combo.activated.connect(self._on_cookies_activated)
+        self.refresh_browsers()
         self.cookies_hint = QLabel("For sites that ask you to sign in. Firefox works best.", self)
         self.cookies_hint.setObjectName("muted")
         self.cookies_hint.setWordWrap(True)
@@ -506,6 +571,111 @@ class AdvancedPanel(QWidget):
             if label:
                 grid.addWidget(self._field_label(label), index, 0)
             grid.addLayout(self._row(items), index, 1)
+
+    # -- cookies --------------------------------------------------------------
+
+    def installed_keys(self) -> list[str]:
+        """The browsers found on this computer (as listed), e.g. ["firefox", "edge"]."""
+        return [key for key, _label in self._browsers]
+
+    def cookie_source(self) -> str:
+        """The chosen cookie source: "" (none), a browser key or "file:<path>"."""
+        return self._cookie_value
+
+    def set_cookie_source(self, value: str) -> None:
+        """Select a cookie source. A browser that isn't found stays listed, marked (not found)."""
+        self._apply_cookie_value(value)
+        self._fill_cookies_combo()
+
+    def refresh_browsers(self, browsers: list[tuple[str, str]] | None = None) -> None:
+        """Look for the installed browsers again (or take `browsers`) and rebuild the list."""
+        self._browsers = installed_browsers() if browsers is None else list(browsers)
+        self._fill_cookies_combo()
+
+    def choose_cookies_file(self) -> bool:
+        """Ask for a cookies.txt file. True when one was chosen; otherwise the previous
+        choice stays selected."""
+        start = cookies_file_path(self._cookie_value) or self._cookies_file or str(default_download_dir())
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Choose a cookies.txt file", start, "Cookies files (*.txt);;All files (*)",
+        )
+        if path:
+            self.set_cookie_source(COOKIES_FILE_PREFIX + QDir.toNativeSeparators(path))
+            return True
+        self._select_cookie_value()
+        return False
+
+    def _apply_cookie_value(self, value: str) -> None:
+        value = value.strip()
+        if is_cookies_file(value):
+            path = cookies_file_path(value)
+            value = COOKIES_FILE_PREFIX + path if path else ""
+            if path:
+                self._cookies_file = path
+        if value != self._cookie_value:
+            self._cookie_value = value
+            self.cookies_changed.emit(value)
+
+    def _fill_cookies_combo(self) -> None:
+        combo = self.cookies_combo
+        value = self._cookie_value
+        combo.blockSignals(True)
+        combo.clear()
+        self._add_cookie_item("None", "", "Don't use cookies.")
+        for key, label in self._browsers:
+            if cookies_locked(key):
+                tip = (f"On Windows, {label} usually keeps its cookies locked away from other "
+                       "apps. If it doesn't work, use Firefox or a cookies.txt file.")
+            else:
+                tip = f"Use your {label} cookies. Sign in to the site in {label} first."
+            self._add_cookie_item(label, key, tip)
+        if value and not is_cookies_file(value) and value not in self.installed_keys():
+            label = browser_label(value)
+            self._add_cookie_item(label + NOT_FOUND, value,
+                                  f"{label} doesn't seem to be set up on this computer.")
+        combo.insertSeparator(combo.count())
+        if self._cookies_file:
+            path = self._cookies_file
+            name = _elide_middle(Path(path).name, COOKIES_FILE_LABEL_CHARS)
+            # A file on the network isn't checked: that can hang the window when it's offline.
+            missing = not is_network_path(path) and not os.path.isfile(path)
+            self._add_cookie_item(name + (NOT_FOUND if missing else ""),
+                                  COOKIES_FILE_PREFIX + path, path)
+        self._add_cookie_item("cookies.txt file…", CHOOSE_COOKIES_FILE,
+                              "Use a cookies.txt file exported with a browser add-on while "
+                              "you're signed in to the site.")
+        combo.blockSignals(False)
+        self._select_cookie_value()
+
+    def _add_cookie_item(self, text: str, data: str, tooltip: str) -> None:
+        self.cookies_combo.addItem(text, data)
+        self.cookies_combo.setItemData(self.cookies_combo.count() - 1, tooltip,
+                                       Qt.ItemDataRole.ToolTipRole)
+
+    def _select_cookie_value(self) -> None:
+        """Show the current cookie source in the list (no change signal)."""
+        combo = self.cookies_combo
+        index = combo.findData(self._cookie_value)
+        combo.blockSignals(True)
+        combo.setCurrentIndex(max(0, index))
+        combo.blockSignals(False)
+        if index < 0:
+            self._apply_cookie_value("")
+
+    def _on_cookies_index_changed(self, index: int) -> None:
+        data = self.cookies_combo.itemData(index)
+        if isinstance(data, str) and data != CHOOSE_COOKIES_FILE:
+            self._apply_cookie_value(data)
+
+    def _on_cookies_activated(self, index: int) -> None:
+        if self.cookies_combo.itemData(index) != CHOOSE_COOKIES_FILE:
+            return
+        if self.cookies_combo.stepping:
+            # Wheel or arrow keys landed on it: stay on the current choice. The file dialog
+            # only opens when "cookies.txt file…" is picked from the open list.
+            self._select_cookie_value()
+        else:
+            self.choose_cookies_file()
 
     def _field_label(self, text: str) -> QLabel:
         label = QLabel(text, self)

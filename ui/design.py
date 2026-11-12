@@ -158,7 +158,9 @@ def build(w: MainWindow, content: QWidget) -> None:
     prompt = _mono_label("›", source, "prompt")
     prompt.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
     prompt.setFixedWidth(18)
-    w.url_edit.setMinimumHeight(92)
+    # At least about three lines; the box grows with the window. A low floor keeps the top
+    # row short on a small laptop screen, so the queue below stays in view.
+    w.url_edit.setMinimumHeight(64)
     slay.addLayout(kit.hbox(prompt, (w.url_edit, 1), spacing=6), 1)
     hint = _mono_label("YouTube, Vimeo, SoundCloud, Twitch… and 1,800+ other sites", source, "hint")
     hint.setWordWrap(True)
@@ -168,20 +170,22 @@ def build(w: MainWindow, content: QWidget) -> None:
 
     inspector = _panel(content, "inspector")
     inspector.setFixedWidth(318)
-    ilay = kit.vbox(spacing=8, margins=(14, 12, 14, 14))
+    # Kept compact: the inspector sets the height of the top row, and every pixel it saves
+    # keeps the queue and its error message in view on a small laptop screen.
+    ilay = kit.vbox(spacing=6, margins=(14, 12, 14, 12))
     inspector.setLayout(ilay)
     w.preset_combo.setMinimumContentsLength(18)
     ilay.addLayout(_section("02", "Format", inspector))
     ilay.addWidget(w.preset_combo)
     ilay.addWidget(w.preset_hint)
-    ilay.addSpacing(6)
+    ilay.addSpacing(4)
     ilay.addLayout(_section("03", "Output", inspector))
     ilay.addWidget(w.folder_edit)
     ilay.addLayout(kit.hbox((w.browse_btn, 1), (w.open_folder_btn, 1), spacing=6))
     ilay.addSpacing(2)
     for check in (w.playlist_check, w.subs_check, w.meta_check):
         ilay.addWidget(check)
-    ilay.addSpacing(6)
+    ilay.addSpacing(4)
     ilay.addLayout(_section("04", "Run", inspector))
     w.download_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     ilay.addWidget(w.download_btn)
@@ -197,8 +201,10 @@ def build(w: MainWindow, content: QWidget) -> None:
     mlay.addLayout(_section("●", "Queue", monitor, w.summary_label, 8, w.clear_finished_btn))
     for column, width in ((1, 150), (2, 140), (3, 86), (4, 58), (5, 124)):
         w.queue.setColumnWidth(column, width)
-    mlay.addWidget(w.queue, 3)
+    # A failed download's message and its one-click fix sit right under the Queue header,
+    # above the list, so a short window doesn't hide them below its bottom edge.
     mlay.addWidget(w.banner)
+    mlay.addWidget(w.queue, 3)
     mlay.addLayout(kit.hbox(w.log_toggle, None, w.copy_log_btn, w.clear_log_btn))
     mlay.addWidget(w.log_view, 2)
     root.addWidget(monitor, 1)

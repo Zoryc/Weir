@@ -19,6 +19,7 @@ from core.deps import DepsManager
 from core.paths import IS_WINDOWS, config_dir, sanitize_inherited_environment
 from core.presets import PresetStore
 from core.settings import Settings
+from core.single_instance import SingleInstance
 from ui.icon import app_icon
 from ui.main_window import MainWindow
 from ui.theme import ThemeManager
@@ -63,6 +64,19 @@ def _install_excepthook() -> None:
     sys.excepthook = hook
 
 
+def _show_handed_over_links(window: MainWindow, links: list[str]) -> None:
+    """Weir was started again: take the new launch's links and bring the window forward."""
+    found = extract_links_from_text("\n".join(links))
+    if found:
+        window.url_edit.add_links(found)
+    if window.isMaximized():  # also true while minimized from maximized
+        window.showMaximized()
+    else:
+        window.showNormal()
+    window.raise_()
+    window.activateWindow()
+
+
 def main() -> int:
     sanitize_inherited_environment()
     _set_windows_app_id()
@@ -75,18 +89,29 @@ def main() -> int:
     app.setWindowIcon(app_icon())
     _install_excepthook()
 
+    links = extract_links_from_text(" ".join(sys.argv[1:]))
+    # One Weir per user: two windows would delete each other's partial downloads and
+    # overwrite each other's settings. A later launch hands its links over and quits
+    # before it creates settings, tool checks or windows.
+    instance = SingleInstance()
+    if instance.start(links):
+        return 0
+
     settings = Settings.load()
     # Fusion + Weir's palette and stylesheet; follows the system light/dark setting.
     theme = ThemeManager(app, DESIGN)
     presets = PresetStore.load()
     deps = DepsManager()
     window = MainWindow(settings, presets, deps, theme)
-    links = extract_links_from_text(" ".join(sys.argv[1:]))
     if links:
         window.url_edit.add_links(links)
+    instance.activation_requested.connect(
+        lambda received: _show_handed_over_links(window, received)
+    )
     window.show()
     deps.refresh()  # version checks run in a background thread
     code = app.exec()
+    instance.close()  # a launch from now on starts fresh instead of waiting for us
     # Destroy the window while Python is still fully alive, so Qt never calls back into
     # half-torn-down Python objects (event filters, overridden methods) at exit.
     shiboken6.delete(window)

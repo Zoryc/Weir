@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import app_dir, config_dir, resource_dir
+from .settings import migrate_template
 
 PRESETS_FILENAME = "presets.json"
 
@@ -147,6 +148,10 @@ def _parse_preset(entry: Any, builtin: bool) -> Preset | None:
     options: dict[str, Any] = {}
     if isinstance(options_raw, dict):
         options = {k: v for k, v in options_raw.items() if k in PRESET_OPTION_KEYS}
+    template = options.get("filename_template")
+    if isinstance(template, str) and template.strip():
+        # A preset saved with an earlier default name pattern gets the current one.
+        options["filename_template"] = migrate_template(template)
     description = entry.get("description", "")
     return Preset(
         name=name.strip(),

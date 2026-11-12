@@ -124,9 +124,24 @@ On first start, Weir offers to download the free tools it uses. One click and yo
 <summary><b>"Sign in to confirm you're not a bot", or an age-restricted video</b></summary>
 <br>
 
-Open **Advanced options → Cookies from** and pick the browser where you're signed in to the
-site, then click **Retry** on the download. Firefox works best: Chrome and Edge lock or encrypt
-their cookies while they're open.
+Click **Use browser cookies** in the error message (or open **Advanced options → Cookies from**)
+and pick the browser where you're signed in to the site, then click **Retry** on the download.
+The list only shows the browsers Weir finds on your computer.
+
+- **Firefox works best**, on Windows and Linux. Sign in to the site in Firefox first. If
+  Firefox isn't in the list, it isn't installed or hasn't been started yet.
+- **On Windows, Chrome, Edge and Brave** keep their cookies locked away from other apps, so
+  Weir usually can't use them there, even with the browser closed. Use Firefox or a cookies.txt
+  file instead.
+- **cookies.txt file…** uses a cookies.txt file exported from your browser while you're signed
+  in to the site. yt-dlp's FAQ, [How do I pass cookies to yt-dlp?](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp),
+  names add-ons that do this: *Get cookies.txt LOCALLY* for Chrome and Edge, *cookies.txt* for
+  Firefox. Avoid look-alikes: an older Chrome add-on called just "Get cookies.txt" was reported
+  as malware and removed from the Chrome Web Store. Export a fresh file if it stops working.
+
+> [!WARNING]
+> A cookies.txt file lets anyone who has it use your account on that site. Keep it to
+> yourself, and delete it when you no longer need it.
 </details>
 
 <details>
@@ -233,6 +248,7 @@ core/downloader.py    queue, QProcess handling, output parsing, cancel + cleanup
 core/deps.py          finding, checking and downloading yt-dlp, ffmpeg and Deno
 core/presets.py       preset loading/saving and argument parsing
 core/errors.py        raw yt-dlp output → friendly message + fix
+core/browsers.py      which browsers are installed, for reading cookies
 core/process.py       child-process environment, process-tree kill
 core/settings.py      settings JSON
 core/paths.py         app, config and tool folders

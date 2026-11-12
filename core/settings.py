@@ -8,16 +8,22 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
+from .browsers import valid_cookie_setting
 from .paths import config_dir, default_download_dir
 
-DEFAULT_TEMPLATE = "%(title)s [%(id)s].%(ext)s"
-COOKIE_BROWSERS: list[tuple[str, str]] = [
-    ("", "None"),
-    ("firefox", "Firefox"),
-    ("chrome", "Chrome"),
-    ("edge", "Edge"),
-    ("brave", "Brave"),
-]
+# The title is cut to 150 bytes: Linux allows 255 bytes per file name, and
+# Japanese or Korean titles take 3 bytes per character.
+DEFAULT_TEMPLATE = "%(title).150B [%(id)s].%(ext)s"
+# Earlier defaults. Saved settings that still hold one of them exactly get the
+# current default (the first one had no length limit, so long titles failed).
+OLD_DEFAULT_TEMPLATES: tuple[str, ...] = ("%(title)s [%(id)s].%(ext)s",)
+
+
+def migrate_template(template: str) -> str:
+    """The current default for a blank template or an old default, otherwise the template itself."""
+    if not template.strip() or template in OLD_DEFAULT_TEMPLATES:
+        return DEFAULT_TEMPLATE
+    return template
 
 
 @dataclass
@@ -63,10 +69,10 @@ class Settings:
     def _normalize(self) -> None:
         if not self.save_dir:
             self.save_dir = str(default_download_dir())
-        if not self.filename_template.strip():
-            self.filename_template = DEFAULT_TEMPLATE
+        self.filename_template = migrate_template(self.filename_template)
         self.max_parallel = max(1, min(3, self.max_parallel))
-        if self.cookies_browser not in {key for key, _ in COOKIE_BROWSERS}:
+        # "" (no cookies), a browser yt-dlp knows, or "file:<path to cookies.txt>".
+        if not valid_cookie_setting(self.cookies_browser):
             self.cookies_browser = ""
 
     def save(self) -> None:

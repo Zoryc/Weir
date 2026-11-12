@@ -14,7 +14,7 @@ from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from PySide6.QtCore import QByteArray, QDir, QPoint, QProcess, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QByteArray, QDir, QEvent, QPoint, QProcess, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -55,6 +55,13 @@ from PySide6.QtWidgets import (
 )
 
 from core import APP_DISPLAY_NAME
+from core.browsers import (
+    browser_label,
+    cookies_file_path,
+    cookies_locked,
+    is_cookies_file,
+    suggest_browser,
+)
 from core.deps import TOOL_KEYS, TOOL_LABELS, DepsManager, describe
 from core.downloader import DownloadJob, DownloadManager, DownloadOptions, JobStatus
 from core.errors import ACTION_COOKIES, ACTION_DENO, ACTION_FFMPEG, ACTION_PRESET, ACTION_UPDATE
@@ -63,7 +70,14 @@ from core.presets import Preset, PresetStore, split_args
 from core.settings import DEFAULT_TEMPLATE, Settings
 
 from . import theme
-from .dialogs import DepsDialog, ErrorDetailsDialog, UpdateDialog, show_about
+from .dialogs import (
+    DepsDialog,
+    ErrorDetailsDialog,
+    UpdateDialog,
+    download_size_text,
+    join_names,
+    show_about,
+)
 from .icon import app_icon, glyph_icon
 from .kit import set_stretch
 from .theme import ThemeManager
@@ -90,6 +104,11 @@ DEFAULT_LOGO_SIZE = 34
 DEFAULT_COLUMN_WIDTHS: dict[int, int] = {
     COL_PRESET: 175, COL_PROGRESS: 150, COL_SPEED: 92, COL_ETA: 64, COL_STATUS: 136,
 }
+FIRST_RUN_SIZE = QSize(1040, 820)
+# Room for the title bar and borders, which resize() doesn't count.
+FRAME_ALLOWANCE = QSize(16, 48)
+# Breathing room (px) when the page scrolls the queue or the error message into view.
+REVEAL_MARGIN = 12
 
 ACTION_LABELS: dict[str, str] = {
     ACTION_COOKIES: "Use browser cookies",
@@ -97,6 +116,13 @@ ACTION_LABELS: dict[str, str] = {
     ACTION_DENO: "Download Deno",
     ACTION_FFMPEG: "Download ffmpeg",
     ACTION_UPDATE: "Update yt-dlp",
+}
+
+# Why the recommended tools matter, for the "download the missing tools?" prompt.
+TOOL_NAMES: dict[str, str] = {"yt-dlp": "yt-dlp", "ffmpeg": "ffmpeg", "deno": "Deno"}
+TOOL_REASONS: dict[str, str] = {
+    "ffmpeg": "Most presets need ffmpeg to join video with audio or to make MP3/MP4 files.",
+    "deno": "YouTube needs Deno to work fully.",
 }
 
 # Parts the design's layout must place (attribute names on MainWindow).
@@ -137,7 +163,8 @@ class MainWindow(QMainWindow):
         self._items: dict[int, QTreeWidgetItem] = {}
         self._deps_dialog: DepsDialog | None = None
         self._startup_check_done = False
-        self._ffmpeg_prompted = False
+        self._tools_prompted = False  # answered the missing-tools prompt this session
+        self._resume_after_install = False  # start the links once the tools install ends
         self._shutting_down = False
         self._force_close = False
         self._loading = True
@@ -414,7 +441,7 @@ class MainWindow(QMainWindow):
             widget.textChanged.connect(self._schedule_save)
         for check in (self.playlist_check, self.subs_check, self.meta_check):
             check.toggled.connect(self._schedule_save)
-        self.cookies_combo.currentIndexChanged.connect(self._schedule_save)
+        self.advanced_panel.cookies_changed.connect(self._schedule_save)
         self.parallel_combo.currentIndexChanged.connect(self._on_parallel_changed)
         self.template_reset_btn.clicked.connect(lambda: self.template_edit.setText(DEFAULT_TEMPLATE))
         self.save_preset_btn.clicked.connect(self._save_as_preset)
@@ -462,7 +489,7 @@ class MainWindow(QMainWindow):
         self.meta_check.setChecked(s.embed_meta)
         self.extra_args_edit.setText(s.extra_args)
         self.template_edit.setText(s.filename_template)
-        self.cookies_combo.setCurrentIndex(max(0, self.cookies_combo.findData(s.cookies_browser)))
+        self.advanced_panel.set_cookie_source(s.cookies_browser)
         self.rate_edit.setText(s.rate_limit)
         self.parallel_combo.setCurrentIndex(max(0, self.parallel_combo.findData(s.max_parallel)))
         self.manager.set_max_parallel(s.max_parallel)
@@ -473,8 +500,19 @@ class MainWindow(QMainWindow):
     def _restore_geometry(self) -> None:
         if self.settings.window_geometry:
             self.restoreGeometry(QByteArray.fromBase64(self.settings.window_geometry.encode("ascii")))
-        else:
-            self.resize(1040, 820)
+            return
+        # First run: the usual size, but never bigger than the screen (820 px is taller than
+        # what a 1366x768 laptop shows), and centred on it so no edge starts off-screen.
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            self.resize(FIRST_RUN_SIZE)
+            return
+        area = screen.availableGeometry()
+        size = FIRST_RUN_SIZE.boundedTo(area.size() - FRAME_ALLOWANCE).expandedTo(self.minimumSize())
+        self.resize(size)
+        frame = size + FRAME_ALLOWANCE
+        self.move(area.x() + max(0, (area.width() - frame.width()) // 2),
+                  area.y() + max(0, (area.height() - frame.height()) // 2))
 
     def _schedule_save(self) -> None:
         if not self._loading:
@@ -489,7 +527,7 @@ class MainWindow(QMainWindow):
         s.embed_meta = self.meta_check.isChecked()
         s.extra_args = self.extra_args_edit.text()
         s.filename_template = self.template_edit.text().strip() or DEFAULT_TEMPLATE
-        s.cookies_browser = str(self.cookies_combo.currentData() or "")
+        s.cookies_browser = self.advanced_panel.cookie_source()
         s.rate_limit = self.rate_edit.text().strip()
         s.max_parallel = int(self.parallel_combo.currentData() or 2)
         s.show_advanced = self.advanced_toggle.isChecked()
@@ -730,7 +768,7 @@ class MainWindow(QMainWindow):
             embed_meta=self.meta_check.isChecked(),
             extra_args=extra,
             filename_template=template,
-            cookies_browser=str(self.cookies_combo.currentData() or ""),
+            cookies_browser=self.advanced_panel.cookie_source(),
             rate_limit=rate,
         )
 
@@ -740,45 +778,96 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Paste a link first.", 4000)
             self.url_edit.setFocus()
             return
-        if not self.deps.tool("yt-dlp").found:
-            QMessageBox.information(
-                self, "One more step",
-                "The downloader (yt-dlp) isn't installed yet.\n\n"
-                "Click “Download it for me” in the next window — it only takes a moment.",
-            )
-            self._show_deps_dialog(install=["yt-dlp"])
-            return
-        if not self.deps.tool("ffmpeg").found and not self._ffmpeg_prompted:
-            self._ffmpeg_prompted = True
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Icon.Question)
-            box.setWindowTitle("ffmpeg is missing")
-            box.setText("Most presets need ffmpeg to join video with audio or to make MP3/MP4 files.")
-            box.setInformativeText("Download it now? Your links will stay in the box.")
-            download = box.addButton("Download ffmpeg", QMessageBox.ButtonRole.AcceptRole)
-            box.addButton("Continue without it", QMessageBox.ButtonRole.RejectRole)
-            box.exec()
-            if box.clickedButton() is download:
-                self._show_deps_dialog(install=["ffmpeg"])
+        missing = self.deps.missing()
+        if "yt-dlp" in missing or (missing and not self._tools_prompted):
+            if not self._offer_missing_tools(missing, len(links)):
                 return
         preset = self._current_preset()
         options = self._current_options()
         if preset is None or options is None:
             return
+        added_ids: set[int] = set()
+        skipped = twice = 0
         for link in links:
-            self.manager.add(link, preset, options)
+            # Already waiting or downloading into this folder with this preset: a second
+            # copy would only fight over the same files.
+            active = self.manager.find_active(link, options.save_dir, preset)
+            if active is not None and active in added_ids:
+                twice += 1  # the same link written twice in the box (e.g. with a slash at the end)
+            elif active is not None:
+                skipped += 1
+            else:
+                added_ids.add(self.manager.add(link, preset, options))
+        added = len(added_ids)
         self.url_edit.clear()
-        self.statusBar().showMessage(
-            f"Added {len(links)} download{'s' if len(links) != 1 else ''} to the list.", 4000
-        )
+        parts: list[str] = []
+        if added:
+            parts.append(f"Added {added} download{'s' if added != 1 else ''} to the list.")
+        if skipped:
+            parts.append(f"{skipped} link{' was' if skipped == 1 else 's were'} already in the list.")
+        if twice:
+            parts.append(f"{twice} link{' was' if twice == 1 else 's were'} listed twice.")
+        self.statusBar().showMessage(" ".join(parts), 6000 if skipped or twice else 4000)
+        if added:
+            QTimer.singleShot(0, self._reveal_queue)  # once the new rows are laid out
+
+    def _offer_missing_tools(self, missing: list[str], link_count: int) -> bool:
+        """One prompt for every missing tool. "Download" installs them all, and the links
+        start by themselves once that is done. Returns True to start the links right away
+        (yt-dlp is there and the user goes on without the recommended tools). Closing the
+        prompt (Esc or ✕) changes nothing: the links stay in the box."""
+        required = "yt-dlp" in missing
+        size = download_size_text(missing)
+        them = "them" if len(missing) > 1 else "it"
+        links = "Your link" if link_count == 1 else f"Your {link_count} links"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        if required:
+            box.setWindowTitle("One last step")
+            if len(missing) > 1:
+                box.setText(f"{APP_DISPLAY_NAME} needs its free helper tools before the first "
+                            f"download ({size}).")
+            else:
+                box.setText(f"{APP_DISPLAY_NAME} needs one free helper tool, yt-dlp, before the "
+                            f"first download ({size}).")
+            reasons = ""
+        else:
+            box.setWindowTitle("Recommended tools")
+            names = join_names([TOOL_NAMES.get(k, k) for k in missing])
+            box.setText(f"{names} {'is' if len(missing) == 1 else 'are'} not installed yet ({size}).")
+            reasons = " ".join(TOOL_REASONS[k] for k in missing if k in TOOL_REASONS) + "\n\n"
+        box.setInformativeText(f"{reasons}Download {them} now? {links} will start automatically.")
+        download = box.addButton(f"Download {them}", QMessageBox.ButtonRole.AcceptRole)
+        go_on = None if required else box.addButton(f"Continue without {them}",
+                                                     QMessageBox.ButtonRole.AcceptRole)
+        later = box.addButton("Not now" if required else "Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(download)
+        box.setEscapeButton(later)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is not download:
+            if go_on is not None and clicked is go_on:
+                self._tools_prompted = True  # don't ask again this session
+                return True
+            return False
+        self._tools_prompted = True
+        self._resume_after_install = True
+        self._show_deps_dialog(install=missing, close_when_done=True)
+        return False
 
     def _retry_jobs(self, job_ids: list[int]) -> None:
         base = self._current_options()
         if base is None:
             return
+        busy = 0
         for job_id in job_ids:
             job = self.manager.get(job_id)
             if job is None or job.process is not None or job.status == JobStatus.WAITING:
+                continue
+            if self.manager.find_active(job.url, job.options.save_dir, job.preset) not in (None, job_id):
+                # The same link was added again with this preset and is waiting or downloading
+                # into the same folder: a second copy would only fight over the same files.
+                busy += 1
                 continue
             # Keep what the job was (link, preset, folder, playlist mode); take the
             # current cookies, speed limit, extra options etc. so fixes apply.
@@ -786,6 +875,13 @@ class MainWindow(QMainWindow):
             self.manager.retry(job_id, options)
             if self.banner.job_id == job_id:
                 self.banner.hide()
+        if busy:
+            self.statusBar().showMessage(
+                "Not retried: that link is already waiting or downloading in the list."
+                if busy == 1 else
+                f"{busy} downloads weren't retried: their links are already waiting or "
+                "downloading in the list.", 6000,
+            )
 
     def _remove_jobs(self, job_ids: list[int]) -> None:
         for job_id in job_ids:
@@ -941,6 +1037,46 @@ class MainWindow(QMainWindow):
         label = ACTION_LABELS.get(job.error.action or "")
         self.banner.show_error(job.id, job.title or job.url, job.error.title, job.error.hint,
                                job.error.action, label)
+        QTimer.singleShot(0, self._reveal_banner)  # once the banner has its place and size
+
+    # The page scrolls when the window is too small for everything (a small laptop screen,
+    # Advanced open...). These bring what just changed back into view; the queue's own
+    # scrollToItem only moves the list, not the page.
+
+    def _reveal_queue(self) -> None:
+        """After Download: show the queue and the links just added (the last rows)."""
+        span = self._queue_span(last_row=True)
+        if span is not None:
+            top, bottom = span
+            self._page.ensureVisible(0, top, 0, REVEAL_MARGIN)
+            self._page.ensureVisible(0, bottom, 0, REVEAL_MARGIN)  # the new rows win
+
+    def _reveal_banner(self) -> None:
+        """After a failure: show the error message and its one-click fix, plus the top of
+        the list if there is room."""
+        content = self._page.widget()
+        if content is None or not self.banner.isVisible() or not content.isAncestorOf(self.banner):
+            return
+        span = self._queue_span(last_row=False)
+        if span is not None:
+            self._page.ensureVisible(0, span[1], 0, REVEAL_MARGIN)
+        self._page.ensureWidgetVisible(self.banner, 0, REVEAL_MARGIN)  # the message wins
+
+    def _queue_span(self, last_row: bool) -> tuple[int, int] | None:
+        """Page y of the queue's top, and of the bottom of its first row in view (or of its
+        last row). Just below the column headers when the list is empty."""
+        content = self._page.widget()
+        if content is None or not self.queue.isVisible() or not content.isAncestorOf(self.queue):
+            return None
+        # Finish pending layout work first (the banner just appeared, rows were just added),
+        # so the positions and the page's scroll range are current.
+        QApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)
+        view = self.queue.viewport()
+        count = self.queue.topLevelItemCount()
+        item = self.queue.topLevelItem(count - 1) if last_row and count else self.queue.itemAt(0, 0)
+        bottom = self.queue.visualItemRect(item).bottom() if item is not None else 0
+        bottom = max(0, min(bottom, view.height() - 1))
+        return self.queue.mapTo(content, QPoint(0, 0)).y(), view.mapTo(content, QPoint(0, bottom)).y()
 
     def _on_queue_finished(self, done: int, failed: int, _cancelled: int) -> None:
         if self._shutting_down or (done == 0 and failed == 0):
@@ -1059,14 +1195,7 @@ class MainWindow(QMainWindow):
     def _on_error_action(self, job_id: int, action: str) -> None:
         job = self.manager.get(job_id)
         if action == ACTION_COOKIES:
-            self.advanced_toggle.setChecked(True)
-            if not self.cookies_combo.currentData():
-                self.cookies_combo.setCurrentIndex(max(0, self.cookies_combo.findData("firefox")))
-            self.cookies_combo.setFocus()
-            self.statusBar().showMessage(
-                f"Cookies will be read from {self.cookies_combo.currentText()}. "
-                "Make sure you're signed in there, then click Retry.", 12000,
-            )
+            self._use_cookies(job)
         elif action == ACTION_PRESET:
             if job is not None:
                 self.url_edit.add_links([job.url])
@@ -1081,18 +1210,150 @@ class MainWindow(QMainWindow):
         elif action == ACTION_UPDATE:
             self._update_ytdlp()
 
+    def _use_cookies(self, job: DownloadJob | None) -> None:
+        """The "Use browser cookies" fix. Picks a cookie source that can work: never a browser
+        that isn't installed, nor the one that just failed. With no browser left, asks for a
+        cookies.txt file and says why."""
+        panel = self.advanced_panel
+        self.advanced_toggle.setChecked(True)
+        panel.refresh_browsers()  # a browser may have been installed or set up since
+        current = panel.cookie_source()
+        tried = job.options.cookies_browser if job is not None else current
+        installed = panel.installed_keys()
+        if current and current != tried and (is_cookies_file(current) or current in installed):
+            pass  # changed since this download failed: keep the user's choice
+        elif is_cookies_file(current):
+            self.statusBar().showMessage(
+                "Those cookies didn't work. Export a fresh cookies.txt while you're signed in "
+                "to the site, then choose it.", 30000,
+            )
+            if not panel.choose_cookies_file():
+                return
+        else:
+            # Never suggest the browser this download just failed with, even if the
+            # choice was changed since (to no cookies, for example).
+            key = suggest_browser([k for k in installed if k != tried], skip=current)
+            if key is not None:
+                panel.set_cookie_source(key)
+            elif current in installed and not cookies_locked(current):
+                label = browser_label(current)
+                self.cookies_combo.setFocus()
+                self.statusBar().showMessage(
+                    f"Cookies from {label} didn't work. Make sure you're signed in to the site in "
+                    f"{label}, then click Retry. You can also pick a cookies.txt file under "
+                    "Cookies from.", 30000,
+                )
+                return
+            else:
+                self._ask_for_cookies_file(installed, current)
+                return
+        self.cookies_combo.setFocus()
+        self._show_cookies_source()
+
+    def _ask_for_cookies_file(self, installed: list[str], current: str) -> None:
+        """No browser to read cookies from: say why, then offer a cookies.txt file.
+
+        A chosen browser that can't work here (not found, or its cookies locked on Windows)
+        is turned off first. Otherwise cancelling the file dialog would leave every later
+        download failing the same way, even on sites that need no cookies."""
+        # Any browser still installed at this point keeps its cookies locked (Windows):
+        # _use_cookies already picked or kept every other one.
+        sentences: list[str] = []
+        firefox_named = False
+        if current and not is_cookies_file(current):
+            self.advanced_panel.set_cookie_source("")
+            label = browser_label(current)
+            if current in installed:
+                sentences.append(f"{label} keeps its cookies locked away from other apps on "
+                                 "Windows, so cookies are off for now.")
+            else:
+                sentences.append(f"{label} wasn't found, so cookies are off for now.")
+                firefox_named = current == "firefox"
+        others = [browser_label(key) for key in installed if key != current and cookies_locked(key)]
+        if others:
+            keeps = "keeps its" if len(others) == 1 else "keep their"
+            locked = (f"{join_names(others)} {keeps} cookies locked away from other apps on "
+                      "Windows.")
+            sentences.append(locked if firefox_named else f"Firefox wasn't found, and {locked}")
+        elif not sentences:
+            sentences.append("No browser with cookies was found on this computer.")
+        elif current in installed:
+            sentences.append("Firefox wasn't found.")
+        else:
+            sentences.append("No other browser with cookies was found.")
+        self.cookies_combo.setFocus()
+        self.statusBar().showMessage(
+            f"{' '.join(sentences)} Install Firefox and sign in to the site there, or choose a "
+            "cookies.txt file exported from your browser.", 30000,
+        )
+        if self.advanced_panel.choose_cookies_file():
+            self._show_cookies_source()
+
+    def _show_cookies_source(self) -> None:
+        value = self.advanced_panel.cookie_source()
+        if is_cookies_file(value):
+            name = Path(cookies_file_path(value)).name
+            text = f"Cookies will be read from {name}. Click Retry to try again."
+        else:
+            text = (f"Cookies will be read from {browser_label(value)}. Make sure you're signed in "
+                    "to the site there, then click Retry.")
+        self.statusBar().showMessage(text, 15000)
+
     # ---------------------------------------------------------- dependencies
 
-    def _show_deps_dialog(self, install: list[str] | None = None, startup: bool = False) -> None:
+    def _show_deps_dialog(self, install: list[str] | None = None, startup: bool = False,
+                          close_when_done: bool = False) -> None:
         if self._deps_dialog is None:
             self._deps_dialog = DepsDialog(self.deps, self.settings, self)
+            self._deps_dialog.tools_changed.connect(self._on_tools_installed)
+            # Closing the tools window gives up on starting the waiting links by themselves.
+            self._deps_dialog.finished.connect(self._forget_resume)
         dialog = self._deps_dialog
         dialog.set_startup_mode(startup)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
         if install:
-            dialog.start_install(install)
+            dialog.start_install(install, close_when_done=close_when_done)
+
+    def _on_tools_installed(self) -> None:
+        """An install in the tools window ended. Start the links that waited for it, once."""
+        resume, self._resume_after_install = self._resume_after_install, False
+        if not resume:
+            if not self.deps.missing():
+                self.statusBar().showMessage("All set! The tools are ready.", 6000)
+            return
+        if not self.url_edit.links():
+            return  # the box was emptied meanwhile: nothing to start
+        dialog = self._deps_dialog
+        stopped = dialog is not None and dialog.stopped_by_user
+        # A tool the user just asked for that didn't install (most presets need ffmpeg):
+        # don't start a batch of downloads that would fail behind the tools window.
+        failed = dialog.failed_tools if dialog is not None else []
+        ytdlp = self.deps.tool("yt-dlp").found
+        if not ytdlp and not stopped and dialog is not None and dialog.isVisible():
+            # yt-dlp didn't install. The tools window stays open and shows why: if it
+            # installs from there after all, the links still start by themselves.
+            self._resume_after_install = True
+            self.statusBar().showMessage(
+                "yt-dlp didn't install, so your links are still in the box. They start by "
+                "themselves once it installs.", 15000,
+            )
+        elif ytdlp and not stopped and not failed:
+            QTimer.singleShot(0, self._start_downloads)
+        elif ytdlp and failed and not stopped:
+            names = join_names([TOOL_NAMES.get(k, k) for k in failed])
+            self.statusBar().showMessage(
+                f"{names} didn't install, so your links are still in the box. "
+                "Click Download to start them anyway.", 15000,
+            )
+        else:
+            self.statusBar().showMessage(
+                "Your links are still in the box. Click Download when you're ready.", 10000
+            )
+
+    def _forget_resume(self, _result: int = 0) -> None:
+        self._resume_after_install = False
 
     def _on_deps_checked(self) -> None:
         self._update_deps_button()
@@ -1101,7 +1362,12 @@ class MainWindow(QMainWindow):
         self._startup_check_done = True
         missing = self.deps.missing()
         if "yt-dlp" in missing or (missing and not self.settings.skip_startup_deps_prompt):
-            QTimer.singleShot(0, lambda: self._show_deps_dialog(startup=True))
+            QTimer.singleShot(0, self._show_startup_deps_dialog)
+
+    def _show_startup_deps_dialog(self) -> None:
+        if self._deps_dialog is not None and self._deps_dialog.isVisible():
+            return  # already open, e.g. installing the tools for the first download
+        self._show_deps_dialog(startup=True)
 
     def _update_deps_button(self) -> None:
         missing = self.deps.missing()

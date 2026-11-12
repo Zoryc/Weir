@@ -11,10 +11,13 @@ Images, for light and dark mode:
     weir-<scheme>-advanced.png   Advanced options + Log open
     weir-<scheme>-small.png      820x620 (small laptop)
     weir-<scheme>-empty.png      nothing queued yet
+    weir-<scheme>-laptop.png     1280x680 (1366x768 laptop, or 1080p at 150 %), as the
+                                 window scrolled itself after the demo failure
 
 --check reports controls missing from the layout, squeezed or cut-off text and
-overlapping controls. The window is never shown on screen; settings go to a
-throw-away folder.
+overlapping controls, and, at 1280x680, an error banner or first queue row left
+outside the visible part of the page. The window is never shown on screen;
+settings go to a throw-away folder.
 """
 
 from __future__ import annotations
@@ -46,6 +49,8 @@ SIZE_DEFAULT = (1040, 820)
 # A neutral folder for the pictures (they end up in the README; no real user names in them).
 DEMO_FOLDER = "C:\\Users\\you\\Downloads" if sys.platform == "win32" else "/home/you/Downloads"
 SIZE_SMALL = (820, 620)
+# What a 1366x768 laptop, or a 1080p screen at 150 %, leaves for the window.
+SIZE_LAPTOP = (1280, 680)
 
 
 def _settle(app: QApplication, rounds: int = 8) -> None:
@@ -164,6 +169,36 @@ def check_layout(win, label: str) -> list[str]:  # noqa: ANN001
     return [f"[{label}] {issue}" for issue in issues]
 
 
+def check_in_view(win, label: str) -> list[str]:  # noqa: ANN001
+    """The error banner and the queue's first row must be inside the visible part of the
+    page, once the window has had the chance to scroll them into view itself."""
+    issues: list[str] = []
+    viewport = win._page.viewport()
+
+    def outside(widget: QWidget, rect: QRect) -> str:
+        top = widget.mapTo(viewport, rect.topLeft()).y()
+        bottom = widget.mapTo(viewport, rect.bottomLeft()).y()
+        if top < 0 or bottom >= viewport.height():
+            return f"at page y {top}..{bottom}, visible part 0..{viewport.height() - 1}"
+        return ""
+
+    if not win.banner.isVisible():
+        issues.append("banner: not shown after a failed download")
+    elif where := outside(win.banner, win.banner.rect()):
+        issues.append(f"banner: outside the visible page ({where})")
+    item = win.queue.topLevelItem(0)
+    if item is None:
+        issues.append("queue: no rows to check")
+    else:
+        row = win.queue.visualItemRect(item)
+        queue_view = win.queue.viewport()
+        if row.top() < 0 or row.bottom() >= queue_view.height():
+            issues.append("queue: first row scrolled out of the list")
+        elif where := outside(queue_view, row):
+            issues.append(f"queue: first row outside the visible page ({where})")
+    return [f"[{label}] {issue}" for issue in issues]
+
+
 def render(app: QApplication, tm, win, out: Path, check: bool) -> list[str]:  # noqa: ANN001
     schemes = [tm.design.scheme] if tm.design.scheme else ["light", "dark"]
     problems: list[str] = []
@@ -174,19 +209,27 @@ def render(app: QApplication, tm, win, out: Path, check: bool) -> list[str]:  # 
             ("-advanced", SIZE_DEFAULT, "demo", True),
             ("-small", SIZE_SMALL, "demo", False),
             ("-empty", SIZE_DEFAULT, "empty", False),
+            ("-laptop", SIZE_LAPTOP, "demo", False),
         ]
         for suffix, size, state, expanded in shots:
             if state == "demo":
-                _populate_demo(win)
+                _populate_demo(win)  # its failed download makes the window scroll to the banner
             else:
                 _clear(win)
             win.advanced_toggle.setChecked(expanded)
             win.log_toggle.setChecked(expanded)
             win.resize(*size)
             _settle(app)
+            laptop = suffix == "-laptop"
+            if not laptop:
+                win._page.verticalScrollBar().setValue(0)  # README pictures show the top
+                _settle(app, 2)
             win.grab().save(str(out / f"weir-{scheme}{suffix}.png"))
             if check:
-                problems += check_layout(win, f"{scheme}{suffix} {size[0]}x{size[1]}")
+                label = f"{scheme}{suffix} {size[0]}x{size[1]}"
+                problems += check_layout(win, label)
+                if laptop:
+                    problems += check_in_view(win, label)
     tm.force_scheme(None)
     return problems
 
