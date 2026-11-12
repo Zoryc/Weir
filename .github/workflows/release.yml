@@ -11,8 +11,14 @@ permissions:
   contents: write
 
 jobs:
+  tests:
+    name: Tests
+    # Never publish a release whose tests fail: reuse the CI workflow's checks.
+    uses: ./.github/workflows/ci.yml
+
   windows:
     name: Windows installer
+    needs: tests
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +50,7 @@ jobs:
 
   linux:
     name: Linux AppImage
+    needs: tests
     # The oldest supported runner: the AppImage then runs on distributions with glibc >= 2.35.
     runs-on: ubuntu-22.04
     steps:
