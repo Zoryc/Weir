@@ -44,6 +44,28 @@ SIGN_IN_ERROR = (
     "--cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp"
     "  for how to manually pass cookies."
 )
+# yt-dlp always appends its cookies hint to YouTube's private-video error.
+PRIVATE_ERROR = (
+    "ERROR: [youtube] abc123def45: Private video. Sign in if you've been granted access to this video. Use "
+    "--cookies-from-browser or --cookies for the authentication. See  "
+    "https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass "
+    "cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips "
+    "on effectively exporting YouTube cookies"
+)
+# yt-dlp's warning when an exported cookies.txt has gone stale.
+ROTATED_COOKIES_WARNING = (
+    "WARNING: [youtube] The provided YouTube account cookies are no longer valid. They have likely been "
+    "rotated in the browser as a security measure. For tips on how to effectively export YouTube cookies, "
+    "refer to  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  ."
+)
+# The two lines after the ERROR are not indented, so they are not part of it.
+GEO_ERROR = [
+    "ERROR: [youtube] abc123def45: The uploader has not made this video available in your country",
+    "This video is available in Germany, France.",
+    "You might want to use a VPN or a proxy server (with --proxy) to workaround.",
+]
+RATE_LIMIT_ERROR = "ERROR: [youtube] abc123def45: Unable to download API page: HTTP Error 429: Too Many Requests"
+VIDEO_DATA_403 = "ERROR: unable to download video data: HTTP Error 403: Forbidden"
 
 T_TOO_LONG = errors._NAME_TOO_LONG.title
 T_IN_USE = errors._FILE_IN_USE.title
@@ -53,6 +75,7 @@ T_FIREFOX = errors._FIREFOX_COOKIES.title
 T_NO_BROWSER = errors._BROWSER_NOT_FOUND.title
 T_LOCKED = errors._BROWSER_COOKIES_LOCKED.title
 T_SIGN_IN = errors._SIGN_IN.title
+T_PRIVATE = errors._PRIVATE.title
 T_UNAVAILABLE = errors._UNAVAILABLE.title
 T_UNSUPPORTED = errors._UNSUPPORTED_URL.title
 T_429 = errors._RATE_LIMITED.title
@@ -183,20 +206,51 @@ CASES: list[tuple[str, list[str], bool, str, str | None]] = [
     ("sign-in-beats-nsig", [*NSIG_WARNING, SIGN_IN_ERROR], True, T_SIGN_IN, ACTION_COOKIES),
     # The site.
     ("format-only", [EXTRACTING, FORMAT_ERROR], True, T_FORMAT, ACTION_PRESET),
-    ("http-403", ["ERROR: unable to download video data: HTTP Error 403: Forbidden"], True, T_403, ACTION_UPDATE),
-    ("http-429", [
-        "ERROR: [youtube] abc123def45: Unable to download API page: HTTP Error 429: Too Many Requests",
-    ], True, T_429, ACTION_COOKIES),
-    ("private-video", [
-        "ERROR: [youtube] abc123def45: Private video. Sign in if you've been granted access to this video",
+    ("http-403", [VIDEO_DATA_403], True, T_403, ACTION_UPDATE),
+    # Refused video data on YouTube usually comes from a failed challenge.
+    ("challenge-then-video-data-403", [EXTRACTING, CHALLENGE_WARNING, VIDEO_DATA_403], True,
+     T_OUTDATED, ACTION_UPDATE),
+    # A refused page is a 403 too, never a network problem.
+    ("webpage-403", [
+        "ERROR: [generic] Unable to download webpage: HTTP Error 403: Forbidden (caused by "
+        "<HTTPError 403: Forbidden>)",
+    ], True, T_403, ACTION_UPDATE),
+    ("vimeo-webpage-403", [
+        "ERROR: [vimeo] 123456789: Unable to download webpage: HTTP Error 403: Forbidden (caused by "
+        "<HTTPError 403: Forbidden>)",
+    ], True, T_403, ACTION_UPDATE),
+    ("instagram-json-403", [
+        "ERROR: [Instagram] C1a2b3c4d5e: Unable to download JSON metadata: HTTP Error 403: Forbidden "
+        "(caused by <HTTPError 403: Forbidden>)",
+    ], True, T_403, ACTION_UPDATE),
+    ("api-page-403-after-challenge", [
+        EXTRACTING, CHALLENGE_WARNING,
+        "ERROR: [youtube] abc123def45: Unable to download API page: HTTP Error 403: Forbidden (caused by "
+        "<HTTPError 403: Forbidden>)",
+    ], True, T_403, ACTION_UPDATE),
+    ("webpage-404", [
+        "ERROR: [generic] Unable to download webpage: HTTP Error 404: Not Found (caused by "
+        "<HTTPError 404: Not Found>)",
     ], True, T_UNAVAILABLE, None),
+    ("webpage-429", [
+        "ERROR: [instagram] C1a2b3c4d5e: Unable to download webpage: HTTP Error 429: Too Many Requests "
+        "(caused by <HTTPError 429: Too Many Requests>)",
+    ], True, T_429, ACTION_COOKIES),
+    ("http-429", [RATE_LIMIT_ERROR], True, T_429, ACTION_COOKIES),
+    ("private-video", [EXTRACTING, PRIVATE_ERROR], True, T_PRIVATE, ACTION_COOKIES),
+    ("private-video-older-wording", [
+        "ERROR: [youtube] abc123def45: Video unavailable. This video is private",
+    ], True, T_PRIVATE, ACTION_COOKIES),
+    ("geo-blocked", [EXTRACTING, *GEO_ERROR], True, T_UNAVAILABLE, None),
+    ("geo-blocked-no-js", [EXTRACTING, NO_JS_WARNING, *GEO_ERROR], False, T_UNAVAILABLE, None),
+    ("geo-blocked-after-challenge", [EXTRACTING, CHALLENGE_WARNING, *GEO_ERROR], True, T_UNAVAILABLE, None),
     ("network", [
         "ERROR: [youtube] abc123def45: Unable to download webpage: <urlopen error [Errno 11001] getaddrinfo "
         "failed> (caused by TransportError('<urlopen error [Errno 11001] getaddrinfo failed>'))",
     ], True, T_NETWORK, None),
     # The last ERROR wins; warnings count only when no ERROR is recognised.
     ("last-error-wins", [
-        "ERROR: [youtube] aaaaaaaaaaa: Private video. Sign in if you've been granted access to this video",
+        PRIVATE_ERROR.replace("abc123def45", "aaaaaaaaaaa"),
         "ERROR: [youtube] bbbbbbbbbbb: Requested format is not available. Use --list-formats",
     ], True, T_FORMAT, ACTION_PRESET),
     ("warning-only", [
@@ -232,8 +286,64 @@ def test_cookie_hints_offer_other_choices() -> None:
 def test_sign_in_hint_names_the_browser_used() -> None:
     error = explain_error([SIGN_IN_ERROR], has_js_runtime=True, cookies_browser="edge")
     assert error.hint.startswith("Cookies from Edge were used")
+    assert error.action == ACTION_COOKIES
     file_error = explain_error([SIGN_IN_ERROR], has_js_runtime=True, cookies_browser="C:/me/cookies.txt")
     assert "cookies.txt file" in file_error.hint
+
+
+def test_private_video_without_cookies_offers_them() -> None:
+    error = explain_error([COMMAND, EXTRACTING, PRIVATE_ERROR], has_js_runtime=True)
+    assert (error.title, error.action) == (T_PRIVATE, ACTION_COOKIES)
+    assert "invited" in error.hint and "Cookies from" in error.hint
+
+
+@pytest.mark.parametrize("warnings", [[], [ROTATED_COOKIES_WARNING]])
+def test_private_video_with_browser_cookies_offers_no_fix(warnings: list[str]) -> None:
+    # Switching browsers would only loop. Failed cookies don't prove the account
+    # wasn't invited (it may be signed out), so the hint doesn't claim that.
+    error = explain_error([COMMAND, EXTRACTING, *warnings, PRIVATE_ERROR], has_js_runtime=True,
+                          cookies_browser="firefox")
+    assert (error.title, error.action) == (T_PRIVATE, None)
+    assert "Cookies from Firefox were used" in error.hint
+    assert "signed in to the site in Firefox" in error.hint
+    assert "can't see it" not in error.hint
+
+
+@pytest.mark.parametrize("warnings", [[], [ROTATED_COOKIES_WARNING]])
+def test_private_video_with_cookies_file_asks_for_a_fresh_one(warnings: list[str]) -> None:
+    # An exported cookies.txt goes stale (YouTube rotates cookies), so an invited
+    # user mostly needs a fresh export; the fix button asks for one.
+    error = explain_error([COMMAND, EXTRACTING, *warnings, PRIVATE_ERROR], has_js_runtime=True,
+                          cookies_browser="C:/me/cookies.txt")
+    assert (error.title, error.action) == (T_PRIVATE, ACTION_COOKIES)
+    assert "Cookies from your cookies.txt file were used" in error.hint
+    assert "fresh cookies.txt" in error.hint
+    assert "can't see it" not in error.hint
+
+
+def test_rate_limit_without_cookies_offers_them() -> None:
+    error = explain_error([RATE_LIMIT_ERROR], has_js_runtime=True)
+    assert (error.title, error.action) == (T_429, ACTION_COOKIES)
+    assert error.hint == errors._RATE_LIMITED.hint
+
+
+@pytest.mark.parametrize("cookies", ["firefox", "C:/me/cookies.txt"])
+def test_rate_limit_with_cookies_keeps_them(cookies: str) -> None:
+    # The cookies may be what works: offering others would switch away from them.
+    error = explain_error([RATE_LIMIT_ERROR], has_js_runtime=True, cookies_browser=cookies)
+    assert (error.title, error.action) == (T_429, None)
+    assert "“Parallel downloads”" in error.hint
+    assert "cookies" not in error.hint.lower()
+
+
+def test_page_403_is_never_a_network_problem() -> None:
+    # Each "Unable to download <what>" form yt-dlp uses for pages and metadata.
+    for what in ("webpage", "API page", "JSON metadata", "XML"):
+        line = (f"ERROR: [vimeo] 123456789: Unable to download {what}: HTTP Error 403: Forbidden "
+                "(caused by <HTTPError 403: Forbidden>)")
+        for has_js, warnings in ((True, []), (True, [CHALLENGE_WARNING]), (False, [NO_JS_WARNING])):
+            error = explain_error([COMMAND, *warnings, line], has_js_runtime=has_js)
+            assert (error.title, error.action) == (T_403, ACTION_UPDATE), (what, warnings)
 
 
 def test_details_keep_the_raw_log() -> None:

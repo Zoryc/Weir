@@ -61,9 +61,13 @@ class _Rule:
     # True for messages that only mean something as an ERROR: yt-dlp also prints
     # them as harmless warnings (e.g. "some formats are DRM protected, skipping").
     errors_only: bool = False
+    # For messages a fixed needle can't pin down. Searched in the lowercased text.
+    pattern: re.Pattern[str] | None = None
 
     def matches(self, text: str) -> bool:
-        return any(needle in text for needle in self.needles)
+        if any(needle in text for needle in self.needles):
+            return True
+        return self.pattern is not None and self.pattern.search(text) is not None
 
 
 # -- problems on this computer ------------------------------------------------
@@ -138,6 +142,17 @@ _BROWSER_COOKIES_LOCKED = _Rule(
 
 # -- the site -----------------------------------------------------------------
 
+# Ahead of _SIGN_IN: yt-dlp ends YouTube's "Private video" error with its usual
+# "Use --cookies-from-browser or --cookies" hint, but cookies only help someone
+# the owner invited. explain_error words it differently once cookies were used.
+_PRIVATE = _Rule(
+    ("private video", "this video is private"),
+    "This video is private.",
+    "Only people the video's owner has invited can watch it. If that's you, open Advanced "
+    "options → Cookies from and pick the browser where you're signed in (Firefox works best), "
+    "then retry.",
+    ACTION_COOKIES,
+)
 _SIGN_IN = _Rule(
     ("sign in to confirm you", "confirm you're not a bot", "confirm you’re not a bot",
      "confirm your age", "age-restricted", "age restricted", "inappropriate for some users",
@@ -160,9 +175,11 @@ _NOT_LIVE_YET = _Rule(
     "Try again once it is live or after it has ended.",
 )
 _UNAVAILABLE = _Rule(
-    ("private video", "video unavailable", "video is unavailable", "this video has been removed",
+    ("video unavailable", "video is unavailable", "this video has been removed",
      "this video is not available", "no longer available",
-     "not available in your country", "blocked it in your country", "geo restrict", "this video is private",
+     # YouTube: "The uploader has not made this video available in your country".
+     "not available in your country", "made this video available in your country",
+     "blocked it in your country", "geo restrict",
      "has been terminated", "account associated with this video has been terminated", "http error 404"),
     "This video is unavailable.",
     "It may be private, deleted, or blocked in your country. Check that the link opens in your browser.",
@@ -182,6 +199,26 @@ _RATE_LIMITED = _Rule(
     "The site is limiting downloads right now.",
     "Wait a little, lower “Parallel downloads” under Advanced options, or use cookies from your browser.",
     ACTION_COOKIES,
+)
+# Used instead when cookies were already used: switching browsers would only drop working ones.
+_RATE_LIMITED_WITH_COOKIES_HINT = (
+    "Wait a little or lower “Parallel downloads” under Advanced options, then retry."
+)
+_FORBIDDEN_TITLE = "The site refused the download (HTTP 403)."
+_FORBIDDEN_HINT = (
+    "Update yt-dlp (Settings → Update yt-dlp) and retry. Using cookies from your browser can also help."
+)
+# The site refused a page yt-dlp needed ("Unable to download webpage: HTTP Error
+# 403: Forbidden", "… API page …", "… JSON metadata …"). It must come before
+# _NETWORK, whose "unable to download webpage" would call it a network problem.
+# Refused video data ("unable to download video data: HTTP Error 403") is left
+# to _FORBIDDEN, last in _RULES, as a failed YouTube challenge often explains it.
+_FORBIDDEN_PAGE = _Rule(
+    (),
+    _FORBIDDEN_TITLE,
+    _FORBIDDEN_HINT,
+    ACTION_UPDATE,
+    pattern=re.compile(r"unable to download (?!video data\b)[^:]*: http error 403\b"),
 )
 _NETWORK = _Rule(
     ("unable to download webpage", "getaddrinfo failed", "name or service not known",
@@ -239,8 +276,8 @@ _FORMAT_UNAVAILABLE = _Rule(
 )
 _FORBIDDEN = _Rule(
     ("http error 403", "403: forbidden"),
-    "The site refused the download (HTTP 403).",
-    "Update yt-dlp (Settings → Update yt-dlp) and retry. Using cookies from your browser can also help.",
+    _FORBIDDEN_TITLE,
+    _FORBIDDEN_HINT,
     ACTION_UPDATE,
 )
 
@@ -256,6 +293,7 @@ _RULES: tuple[_Rule, ...] = (
     _FIREFOX_COOKIES,
     _BROWSER_NOT_FOUND,
     _BROWSER_COOKIES_LOCKED,
+    _PRIVATE,
     _SIGN_IN,
     _DRM,
     _NOT_LIVE_YET,
@@ -263,6 +301,7 @@ _RULES: tuple[_Rule, ...] = (
     _UNSUPPORTED_URL,
     _INVALID_URL,
     _RATE_LIMITED,
+    _FORBIDDEN_PAGE,
     _NETWORK,
     _NEEDS_DENO,
     _TOO_OLD,
@@ -362,11 +401,59 @@ def _pick_rule(lines: Sequence[str], *, has_js_runtime: bool) -> _Rule | None:
     return None
 
 
+_COOKIES_FILE_SOURCE = "your cookies.txt file"
+
+
 def _cookie_source(cookies_browser: str) -> str:
     value = cookies_browser.strip()
     if "/" in value or "\\" in value or value.lower().endswith(".txt"):
-        return "your cookies.txt file"
+        return _COOKIES_FILE_SOURCE
     return _BROWSER_NAMES.get(value.lower(), value.capitalize())
+
+
+def _advice_with_cookies(rule: _Rule, source: str) -> tuple[str, str | None]:
+    """Hint and action once cookies from `source` were used for the failed download.
+
+    A sign-in request names the cookies that didn't work. For rate limiting,
+    other cookies won't help: "Use browser cookies" would only switch away from
+    cookies that work, so it isn't offered. A private video names the cookies
+    too. Its fix is kept only for a cookies.txt, where it asks for a fresh
+    export (YouTube rotates exported cookies, so old ones stop working); for a
+    browser it would just switch browsers, again and again.
+    """
+    if rule is _SIGN_IN:
+        if source == _COOKIES_FILE_SOURCE:
+            return (
+                "Cookies from your cookies.txt file were used but didn't work. Export a fresh "
+                "cookies.txt while you're signed in to the site, then retry.",
+                rule.action,
+            )
+        return (
+            f"Cookies from {source} were used but didn't work. Make sure you're "
+            "signed in to the site in that browser, close the browser, and retry. Firefox works best.",
+            rule.action,
+        )
+    if rule is _PRIVATE:
+        # The cookies didn't give access, which doesn't prove their account wasn't invited:
+        # they may be logged out or out of date, so don't claim it can't see the video.
+        if source == _COOKIES_FILE_SOURCE:
+            return (
+                "Only people the video's owner has invited can watch it. Cookies from your "
+                "cookies.txt file were used but didn't give access: they may be from another "
+                "account, or out of date (older exports stop working). Export a fresh cookies.txt "
+                "while you're signed in with the invited account, choose it under Advanced "
+                "options → Cookies from, then retry.",
+                rule.action,
+            )
+        return (
+            f"Only people the video's owner has invited can watch it. Cookies from {source} were "
+            f"used but didn't give access. Make sure you're signed in to the site in {source} "
+            "with the account that was invited, then retry.",
+            None,
+        )
+    if rule is _RATE_LIMITED:
+        return _RATE_LIMITED_WITH_COOKIES_HINT, None
+    return rule.hint, rule.action
 
 
 def explain_error(lines: Sequence[str], *, has_js_runtime: bool, cookies_browser: str = "") -> FriendlyError:
@@ -381,17 +468,8 @@ def explain_error(lines: Sequence[str], *, has_js_runtime: bool, cookies_browser
             None,
             details,
         )
-    hint = rule.hint
-    if rule is _SIGN_IN and cookies_browser.strip():
-        source = _cookie_source(cookies_browser)
-        if source == "your cookies.txt file":
-            hint = (
-                "Cookies from your cookies.txt file were used but didn't work. Export a fresh "
-                "cookies.txt while you're signed in to the site, then retry."
-            )
-        else:
-            hint = (
-                f"Cookies from {source} were used but didn't work. Make sure you're "
-                "signed in to the site in that browser, close the browser, and retry. Firefox works best."
-            )
-    return FriendlyError(rule.title, hint, rule.action, details)
+    if cookies_browser.strip():
+        hint, action = _advice_with_cookies(rule, _cookie_source(cookies_browser))
+    else:
+        hint, action = rule.hint, rule.action
+    return FriendlyError(rule.title, hint, action, details)
