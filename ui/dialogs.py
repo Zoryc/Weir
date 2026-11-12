@@ -146,11 +146,16 @@ class DepsDialog(QDialog):
         buttons.addWidget(self._close_button)
         layout.addLayout(buttons)
 
+        # What each tool is doing while an install runs: "waiting", "downloading", "installing".
+        self._stages: dict[str, str] = {}
+        self._percent: dict[str, int] = {}
         self._installer.progress.connect(self._on_progress)
         self._installer.message.connect(self._message.setText)
+        self._installer.stage.connect(self._on_stage)
         self._installer.tool_finished.connect(self._on_tool_finished)
         self._installer.all_finished.connect(self._on_all_finished)
         self._deps.checked.connect(self._refresh)
+        self._deps.updated.connect(self._refresh)
         self._refresh()
 
     @property
@@ -168,10 +173,13 @@ class DepsDialog(QDialog):
         if self._installer.busy or not keys:
             return
         self._failures = []
+        self._stages = {key: "waiting" for key in keys}
+        self._percent = {}
         self._progress.setRange(0, 0)
         self._progress.setVisible(True)
         self._set_buttons_enabled(False)
         self._close_button.setText("Stop")
+        self._refresh()
         self._installer.install(keys)
 
     def _set_buttons_enabled(self, enabled: bool) -> None:
@@ -179,27 +187,45 @@ class DepsDialog(QDialog):
             button.setEnabled(enabled)
         self._install_all.setEnabled(enabled)
 
+    def _status_html(self, key: str) -> str:
+        """One row's status. A red ✖ only for a real failure or a tool that is truly missing,
+        never while something is still being downloaded, installed or checked."""
+        t = theme.current()
+        info = self._deps.tool(key)
+        stage = self._stages.get(key)
+        if stage == "waiting":
+            return f"<span style='color:{t.muted}'>Waiting…</span>"
+        if stage == "downloading":
+            percent = self._percent.get(key)
+            done = f" {percent} %" if percent is not None else ""
+            return f"<span style='color:{t.accent_text}'>Downloading…{done}</span>"
+        if stage == "installing":
+            return f"<span style='color:{t.accent_text}'>Installing…</span>"
+        if self._deps.checking and not self._deps.has_checked:
+            return f"<span style='color:{t.muted}'>Checking…</span>"
+        if info.found:
+            if info.version is None and self._deps.checking:
+                detail = "Installed — checking version…"
+            else:
+                detail = describe(info)
+            return f"<span style='color:{t.success}'>✔</span> {html.escape(detail)}"
+        return f"<span style='color:{t.danger}'>✖</span> {html.escape(describe(info))}"
+
     def _refresh(self) -> None:
         missing = self._deps.missing()
         for key in TOOL_KEYS:
             info = self._deps.tool(key)
-            label = self._status[key]
-            if self._deps.checking and not self._deps.has_checked:
-                label.setText("Checking…")
-            elif info.found:
-                label.setText(f"<span style='color:{theme.current().success}'>✔</span> "
-                              f"{html.escape(describe(info))}")
-            else:
-                label.setText(f"<span style='color:{theme.current().danger}'>✖</span> "
-                              f"{html.escape(describe(info))}")
+            self._status[key].setText(self._status_html(key))
             self._buttons[key].setText("Re-download" if info.found else "Download")
             self._buttons[key].setToolTip(
                 "Download the latest version into the app's tools folder" if info.found
                 else f"Download {TOOL_LABELS[key]} for me"
             )
         self._linux_hint.setVisible(IS_LINUX and "ffmpeg" in missing)
-        self._install_all.setVisible(bool(missing))
-        if missing:
+        self._install_all.setVisible(bool(missing) or self._installer.busy)
+        if self._installer.busy:
+            self._install_all.setText("Downloading…")
+        elif missing:
             names = ", ".join(TOOL_LABELS[k] for k in missing)
             self._install_all.setText(f"Download it for me ({names})")
         if not self._installer.busy:
@@ -207,25 +233,42 @@ class DepsDialog(QDialog):
             if not missing and self._deps.has_checked and not self._failures:
                 self._message.setText("All set! Everything the app needs is installed.")
 
-    def _on_progress(self, _key: str, received: float, total: float) -> None:
+    def _on_progress(self, key: str, received: float, total: float) -> None:
         if total > 0:
             self._progress.setRange(0, 1000)
             self._progress.setValue(int(received / total * 1000))
+            percent = int(received / total * 100)
+            if self._percent.get(key) != percent:
+                self._percent[key] = percent
+                self._status[key].setText(self._status_html(key))
         else:
             self._progress.setRange(0, 0)
 
+    def _on_stage(self, key: str, stage: str) -> None:
+        self._stages[key] = stage
+        if stage == "installing":
+            self._progress.setRange(0, 0)  # unpacking: no byte count to show
+        self._status[key].setText(self._status_html(key))
+
     def _on_tool_finished(self, key: str, ok: bool, text: str) -> None:
+        self._stages.pop(key, None)
         if not ok:
             self._failures.append(f"{TOOL_LABELS[key]}: {text}")
+            self._status[key].setText(self._status_html(key))
+            return
+        # Start the version check first, then show the tool as present right away
+        # ("Installed — checking version…"); the check fills in the version.
+        self._deps.refresh()
+        self._deps.relocate(key)
 
     def _on_all_finished(self, _ok: bool) -> None:
+        self._stages.clear()
         self._progress.setVisible(False)
         self._close_button.setText("Close")
         if self._failures:
             self._message.setText("Something went wrong:\n" + "\n".join(self._failures))
         else:
-            self._message.setText("Download complete. Checking the tools…")
-        self._deps.refresh()
+            self._message.setText("All set! Everything the app needs is installed.")
         self.tools_changed.emit()
         self._refresh()
 

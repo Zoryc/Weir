@@ -449,6 +449,7 @@ class MainWindow(QMainWindow):
         self.manager.stopped.connect(self._on_manager_stopped)
 
         self.deps.checked.connect(self._on_deps_checked)
+        self.deps.updated.connect(self._update_deps_button)
 
     # ------------------------------------------------------------ settings
 

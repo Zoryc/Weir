@@ -146,7 +146,8 @@ def probe_version(info: ToolInfo) -> str | None:
 class DepsManager(QObject):
     """Keeps the latest known state of the three tools. Version checks run off the UI thread."""
 
-    checked = Signal()
+    checked = Signal()  # a version check finished
+    updated = Signal()  # a tool was found again right away (e.g. just installed); version may be unknown
     _results = Signal(int, object)
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -178,6 +179,14 @@ class DepsManager(QObject):
         self.checking = False
         self.has_checked = True
         self.checked.emit()
+
+    def relocate(self, key: str) -> ToolInfo:
+        """Find a tool again immediately (cheap file checks), e.g. right after installing it,
+        so the UI can show it as present without waiting for the slower version check."""
+        info = locate(key)
+        self.tools[key] = info  # version unknown until the next refresh()
+        self.updated.emit()
+        return info
 
     def tool(self, key: str) -> ToolInfo:
         info = self.tools.get(key)
@@ -331,6 +340,7 @@ class DependencyInstaller(QObject):
 
     progress = Signal(str, float, float)  # key, received bytes, total bytes (0 = unknown)
     message = Signal(str)
+    stage = Signal(str, str)  # key, "downloading" | "installing"
     tool_finished = Signal(str, bool, str)  # key, ok, message
     all_finished = Signal(bool)  # True if every requested tool installed
     _unpacked = Signal(str, bool, str)
@@ -399,6 +409,7 @@ class DependencyInstaller(QObject):
             self._fail(key, f"Can't create the tools folder: {exc}")
             return
         self._current = asset_for(key)
+        self.stage.emit(key, "downloading")
         self._expected_hash = None
         if self._current.checksum_url:
             self.message.emit(f"Preparing {TOOL_LABELS[key]}…")
@@ -496,6 +507,7 @@ class DependencyInstaller(QObject):
             return
 
         self.message.emit(f"Installing {TOOL_LABELS[asset.key]}…")
+        self.stage.emit(asset.key, "installing")
         temp_path = self._temp_path
         bin_dir = self._bin_dir
         assert temp_path is not None and bin_dir is not None
