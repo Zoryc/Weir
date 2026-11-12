@@ -70,6 +70,7 @@ def join_names(names: list[str]) -> str:
 
 TITLE_TOOLS = "Tools used by the downloader"
 TITLE_WELCOME = f"Welcome to {APP_DISPLAY_NAME}: one last step"
+COPIED_FEEDBACK_MS = 1500  # how long the error details' Copy button reads "Copied!"
 
 
 def _mono_font_edit(parent: QWidget) -> QPlainTextEdit:
@@ -210,11 +211,6 @@ class DepsDialog(QDialog):
         """True when the user stopped the current (or last) install with "Stop"."""
         return self._stopping
 
-    @property
-    def failed_tools(self) -> list[str]:
-        """Tools whose last install failed (stopping on purpose doesn't count)."""
-        return [key for key in TOOL_KEYS if key in self._failures]
-
     def stop(self) -> None:
         """Abort a running download without asking (used when the app quits)."""
         if self._installer.busy:
@@ -352,6 +348,10 @@ class DepsDialog(QDialog):
         elif self._stopping:  # stopped too late: the last tool was already on its way in
             self._message.setText("Stopped, but the tools had already finished downloading: "
                                   "everything is installed.")
+        elif missing := self._deps.missing():
+            # This run only covered some tools (one row's Download): others are still missing.
+            self._message.setText("Done. Still not installed: "
+                                  f"{join_names([TOOL_LABELS[k] for k in missing])}.")
         else:
             self._message.setText("All set! Everything the app needs is installed.")
         self.tools_changed.emit()
@@ -521,7 +521,9 @@ class ErrorDetailsDialog(QDialog):
     def _copy_text(self) -> None:
         QGuiApplication.clipboard().setText(self._error.as_text(self._url))
         self._copy.setText("Copied!")
-        QTimer.singleShot(1500, lambda: self._copy.setText("Copy"))
+        # The button is the timer's context: the dialog deletes itself on close, and closing
+        # it within the delay must drop the timer instead of touching a deleted button.
+        QTimer.singleShot(COPIED_FEEDBACK_MS, self._copy, lambda: self._copy.setText("Copy"))
 
 
 def show_about(parent: QWidget, deps: DepsManager) -> None:

@@ -14,7 +14,7 @@ from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from PySide6.QtCore import QByteArray, QDir, QEvent, QPoint, QProcess, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QByteArray, QDir, QEvent, QPoint, QProcess, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -152,6 +152,11 @@ def _short_url(url: str) -> str:
 
 
 class MainWindow(QMainWindow):
+    # Emitted once, when the window really starts quitting: right away when nothing runs,
+    # or after "Stop them and quit?" -> Yes while it waits for the downloads to stop.
+    # Not when a quit is declined.
+    shutdown_started = Signal()
+
     def __init__(self, settings: Settings, presets: PresetStore, deps: DepsManager,
                  theme_manager: ThemeManager) -> None:
         super().__init__()
@@ -165,7 +170,9 @@ class MainWindow(QMainWindow):
         self._startup_check_done = False
         self._tools_prompted = False  # answered the missing-tools prompt this session
         self._resume_after_install = False  # start the links once the tools install ends
+        self._resume_tools: list[str] = []  # the tools asked for with those links
         self._shutting_down = False
+        self._shutdown_announced = False  # shutdown_started was emitted
         self._force_close = False
         self._loading = True
         self._save_timer = QTimer(self)
@@ -799,7 +806,9 @@ class MainWindow(QMainWindow):
             else:
                 added_ids.add(self.manager.add(link, preset, options))
         added = len(added_ids)
-        self.url_edit.clear()
+        # Started now: nothing waits for the tools window to start these links any more.
+        self._resume_after_install = False
+        self._remove_links(links)
         parts: list[str] = []
         if added:
             parts.append(f"Added {added} download{'s' if added != 1 else ''} to the list.")
@@ -810,6 +819,16 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(" ".join(parts), 6000 if skipped or twice else 4000)
         if added:
             QTimer.singleShot(0, self._reveal_queue)  # once the new rows are laid out
+
+    def _remove_links(self, links: list[str]) -> None:
+        """Take these links out of the box. Links that arrived while a prompt was open (a
+        second launch hands its links over even then) stay for the next Download."""
+        done = set(links)
+        left = [link for link in self.url_edit.links() if link not in done]
+        if left:
+            self.url_edit.setPlainText("\n".join(left))
+        else:
+            self.url_edit.clear()
 
     def _offer_missing_tools(self, missing: list[str], link_count: int) -> bool:
         """One prompt for every missing tool. "Download" installs them all, and the links
@@ -852,6 +871,7 @@ class MainWindow(QMainWindow):
             return False
         self._tools_prompted = True
         self._resume_after_install = True
+        self._resume_tools = list(missing)
         self._show_deps_dialog(install=missing, close_when_done=True)
         return False
 
@@ -1212,8 +1232,8 @@ class MainWindow(QMainWindow):
 
     def _use_cookies(self, job: DownloadJob | None) -> None:
         """The "Use browser cookies" fix. Picks a cookie source that can work: never a browser
-        that isn't installed, nor the one that just failed. With no browser left, asks for a
-        cookies.txt file and says why."""
+        that isn't installed, nor the one that just failed while another one can be read.
+        With no browser left, asks for a cookies.txt file and says why."""
         panel = self.advanced_panel
         self.advanced_toggle.setChecked(True)
         panel.refresh_browsers()  # a browser may have been installed or set up since
@@ -1230,13 +1250,18 @@ class MainWindow(QMainWindow):
             if not panel.choose_cookies_file():
                 return
         else:
-            # Never suggest the browser this download just failed with, even if the
-            # choice was changed since (to no cookies, for example).
+            # Never suggest the browser this download just failed with while there is
+            # another one, even if the choice was changed since (to no cookies, for example).
             key = suggest_browser([k for k in installed if k != tried], skip=current)
+            # Nothing else to suggest: the chosen browser, or else the one that failed (cookies
+            # turned off since), may still work once the user signs in to the site there.
+            again = next((k for k in (current, tried)
+                          if k in installed and not cookies_locked(k)), None)
             if key is not None:
                 panel.set_cookie_source(key)
-            elif current in installed and not cookies_locked(current):
-                label = browser_label(current)
+            elif again is not None:
+                panel.set_cookie_source(again)
+                label = browser_label(again)
                 self.cookies_combo.setFocus()
                 self.statusBar().showMessage(
                     f"Cookies from {label} didn't work. Make sure you're signed in to the site in "
@@ -1256,35 +1281,41 @@ class MainWindow(QMainWindow):
         A chosen browser that can't work here (not found, or its cookies locked on Windows)
         is turned off first. Otherwise cancelling the file dialog would leave every later
         download failing the same way, even on sites that need no cookies."""
-        # Any browser still installed at this point keeps its cookies locked (Windows):
-        # _use_cookies already picked or kept every other one.
+        # _use_cookies already picked or kept every browser whose cookies can be read, so
+        # any still installed here keeps them locked (Windows). The wording still only
+        # states what is true of this computer: Firefox "wasn't found" only when it isn't
+        # installed, and "no browser" only when none is.
         sentences: list[str] = []
-        firefox_named = False
+        firefox = "firefox" in installed
         if current and not is_cookies_file(current):
             self.advanced_panel.set_cookie_source("")
             label = browser_label(current)
-            if current in installed:
+            if current not in installed:
+                sentences.append(f"{label} wasn't found, so cookies are off for now.")
+            elif cookies_locked(current):
                 sentences.append(f"{label} keeps its cookies locked away from other apps on "
                                  "Windows, so cookies are off for now.")
             else:
-                sentences.append(f"{label} wasn't found, so cookies are off for now.")
-                firefox_named = current == "firefox"
+                sentences.append(f"Cookies from {label} didn't work, so cookies are off for now.")
+        # Not said yet that Firefox, the browser to use instead, is missing.
+        firefox_missing = not firefox and current != "firefox"
         others = [browser_label(key) for key in installed if key != current and cookies_locked(key)]
         if others:
             keeps = "keeps its" if len(others) == 1 else "keep their"
             locked = (f"{join_names(others)} {keeps} cookies locked away from other apps on "
                       "Windows.")
-            sentences.append(locked if firefox_named else f"Firefox wasn't found, and {locked}")
-        elif not sentences:
-            sentences.append("No browser with cookies was found on this computer.")
-        elif current in installed:
+            sentences.append(f"Firefox wasn't found, and {locked}" if firefox_missing else locked)
+        elif not installed:
+            sentences.append("No other browser with cookies was found." if sentences
+                             else "No browser with cookies was found on this computer.")
+        elif firefox_missing:
             sentences.append("Firefox wasn't found.")
-        else:
-            sentences.append("No other browser with cookies was found.")
+        advice = ("Make sure you're signed in to the site in Firefox" if firefox
+                  else "Install Firefox and sign in to the site there")
         self.cookies_combo.setFocus()
         self.statusBar().showMessage(
-            f"{' '.join(sentences)} Install Firefox and sign in to the site there, or choose a "
-            "cookies.txt file exported from your browser.", 30000,
+            " ".join([*sentences, f"{advice}, or choose a cookies.txt file exported from your "
+                                  "browser."]), 30000,
         )
         if self.advanced_panel.choose_cookies_file():
             self._show_cookies_source()
@@ -1317,7 +1348,8 @@ class MainWindow(QMainWindow):
             dialog.start_install(install, close_when_done=close_when_done)
 
     def _on_tools_installed(self) -> None:
-        """An install in the tools window ended. Start the links that waited for it, once."""
+        """An install in the tools window ended. Start the links that waited for it, once
+        every tool asked for with them is there."""
         resume, self._resume_after_install = self._resume_after_install, False
         if not resume:
             if not self.deps.missing():
@@ -1327,22 +1359,33 @@ class MainWindow(QMainWindow):
             return  # the box was emptied meanwhile: nothing to start
         dialog = self._deps_dialog
         stopped = dialog is not None and dialog.stopped_by_user
-        # A tool the user just asked for that didn't install (most presets need ffmpeg):
-        # don't start a batch of downloads that would fail behind the tools window.
-        failed = dialog.failed_tools if dialog is not None else []
-        ytdlp = self.deps.tool("yt-dlp").found
-        if not ytdlp and not stopped and dialog is not None and dialog.isVisible():
-            # yt-dlp didn't install. The tools window stays open and shows why: if it
-            # installs from there after all, the links still start by themselves.
-            self._resume_after_install = True
+        # A tool asked for with the links that still isn't there (most presets need ffmpeg):
+        # don't start a batch of downloads that would fail behind the tools window. Checked
+        # against what is installed, not only the last run's failures: after yt-dlp and
+        # ffmpeg failed, a second try of yt-dlp alone still leaves ffmpeg missing.
+        lacking = [key for key in self.deps.missing()
+                   if key in self._resume_tools or key == "yt-dlp"]
+        names = join_names([TOOL_NAMES.get(k, k) for k in lacking])
+        if stopped:
             self.statusBar().showMessage(
-                "yt-dlp didn't install, so your links are still in the box. They start by "
-                "themselves once it installs.", 15000,
+                "Your links are still in the box. Click Download when you're ready.", 10000
             )
-        elif ytdlp and not stopped and not failed:
+        elif not lacking:
             QTimer.singleShot(0, self._start_downloads)
-        elif ytdlp and failed and not stopped:
-            names = join_names([TOOL_NAMES.get(k, k) for k in failed])
+        elif dialog is not None and dialog.isVisible():
+            # The tools window stays open and shows why: if the tools install from there
+            # after all, the links still start by themselves.
+            self._resume_after_install = True
+            if "yt-dlp" in lacking:
+                # Name the tools: "They start … once they're installed" reads as the links.
+                once = "it installs" if len(lacking) == 1 else f"{names} are installed"
+                text = (f"{names} didn't install, so your links are still in the box. They start "
+                        f"by themselves once {once}.")
+            else:
+                text = (f"{names} didn't install, so your links are still in the box. "
+                        "Click Download to start them anyway.")
+            self.statusBar().showMessage(text, 15000)
+        elif "yt-dlp" not in lacking:
             self.statusBar().showMessage(
                 f"{names} didn't install, so your links are still in the box. "
                 "Click Download to start them anyway.", 15000,
@@ -1412,6 +1455,7 @@ class MainWindow(QMainWindow):
                     event.ignore()
                     return
             self._shutting_down = True
+            self._announce_shutdown()
             self.setEnabled(False)
             self.statusBar().showMessage("Stopping downloads…")
             self.manager.cancel_all()
@@ -1440,9 +1484,17 @@ class MainWindow(QMainWindow):
                     event.ignore()
                     return
             self._deps_dialog.stop()
+        self._announce_shutdown()
         self._save_timer.stop()
         self._save_settings()
         if self.tray is not None:
             self.tray.hide()
         event.accept()
         QTimer.singleShot(0, QApplication.quit)
+
+    def _announce_shutdown(self) -> None:
+        """Emit shutdown_started, once: the cancel wait ends in a second close() that
+        passes through _finish_shutdown too."""
+        if not self._shutdown_announced:
+            self._shutdown_announced = True
+            self.shutdown_started.emit()

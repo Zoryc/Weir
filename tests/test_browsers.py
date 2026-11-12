@@ -504,6 +504,49 @@ def test_fix_keeps_the_only_browser_and_says_to_sign_in(window: Any, found: Any,
     assert file_dialog["asked"] == 0
 
 
+@pytest.mark.parametrize("system, browsers", [
+    ("linux", [("firefox", "Firefox")]),
+    ("win32", [("firefox", "Firefox"), ("chrome", "Chrome")]),  # Chrome's cookies are locked
+])
+def test_fix_goes_back_to_the_browser_that_failed_when_nothing_else_can_be_read(
+        window: Any, found: Any, platform: Any, file_dialog: Any, system: str,
+        browsers: list[tuple[str, str]]) -> None:
+    platform(system)
+    found[:] = browsers
+    job_id = _failed_job(window, "firefox")
+    window.advanced_panel.set_cookie_source("")  # cookies turned off since it failed
+    message = _use_cookies(window, job_id)
+    assert window.advanced_panel.cookie_source() == "firefox"
+    assert message.startswith("Cookies from Firefox didn't work. Make sure you're signed in to "
+                              "the site in Firefox, then click Retry.")
+    assert "wasn't found" not in message and "No browser" not in message
+    assert file_dialog["asked"] == 0
+
+
+@pytest.mark.parametrize("system, installed, expected", [
+    ("linux", ["firefox"],
+     "Make sure you're signed in to the site in Firefox, or choose a cookies.txt file"),
+    ("win32", ["firefox", "chrome"],
+     "Chrome keeps its cookies locked away from other apps on Windows. Make sure you're "
+     "signed in to the site in Firefox, or choose a cookies.txt file"),
+    ("win32", ["chrome"],
+     "Firefox wasn't found, and Chrome keeps its cookies locked away from other apps on "
+     "Windows. Install Firefox and sign in to the site there, or choose a cookies.txt file"),
+])
+def test_cookies_file_request_only_says_what_is_true_here(window: Any, platform: Any,
+                                                          file_dialog: Any, system: str,
+                                                          installed: list[str],
+                                                          expected: str) -> None:
+    platform(system)
+    window._ask_for_cookies_file(installed, "")
+    message = window.statusBar().currentMessage()
+    assert message.startswith(expected)
+    if "firefox" in installed:
+        assert "Firefox wasn't found" not in message and "Install Firefox" not in message
+    assert "No browser" not in message, "a browser was found"
+    assert file_dialog["asked"] == 1
+
+
 def test_fix_keeps_a_choice_made_after_the_failure(window: Any, platform: Any) -> None:
     platform("win32")
     job_id = _failed_job(window, "")

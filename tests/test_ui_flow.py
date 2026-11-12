@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QObject, QRect, Signal
+from PySide6.QtCore import QEvent, QObject, QRect, Qt, Signal
 from PySide6.QtGui import QScreen
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from core.deps import TOOL_KEYS, ToolInfo
@@ -145,6 +146,14 @@ def prompts(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(QMessageBox, "question",
                         lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes)
     return state
+
+
+@pytest.fixture
+def quits(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """QApplication.quit only records the call, so the test run goes on."""
+    calls: list[bool] = []
+    monkeypatch.setattr(QApplication, "quit", lambda: calls.append(True))
+    return calls
 
 
 @pytest.fixture
@@ -377,6 +386,25 @@ def test_continue_without_recommended_tools_starts_now_and_asks_once(qapp, make_
     assert win.added[-1] == "https://example.com/watch?v=three"
 
 
+def test_link_handed_over_while_the_prompt_is_open_is_kept(qapp, make_window, prompts,
+                                                           monkeypatch):
+    win = make_window(installed=["yt-dlp"])
+    later = "https://example.com/watch?v=three"
+    answer = QMessageBox.exec  # the prompts fixture's stand-in
+
+    def hand_over_then_answer(box: QMessageBox) -> int:
+        # A second launch hands its link over while the prompt runs its own event loop
+        # (main.py adds it to the box).
+        win.url_edit.add_links([later])
+        return answer(box)
+
+    monkeypatch.setattr(QMessageBox, "exec", hand_over_then_answer)
+    prompts["answer"] = "Continue without"
+    win._start_downloads()
+    assert win.added == LINKS
+    assert win.url_edit.links() == [later], "waits in the box for the next Download"
+
+
 def test_startup_window_does_not_take_over_a_running_install(qapp, make_window, prompts):
     from ui.dialogs import TITLE_TOOLS, TITLE_WELCOME
 
@@ -412,6 +440,59 @@ def test_links_wait_when_a_recommended_tool_did_not_install(qapp, make_window, p
     _settle(qapp)
     assert len(prompts["shown"]) == 1
     assert win.added == LINKS
+
+
+def test_links_wait_for_every_tool_asked_for_not_only_the_last_try(qapp, make_window, prompts):
+    win = make_window()
+    prompts["answer"] = "Download"
+    win._start_downloads()
+    dialog = win._deps_dialog
+    installer = dialog._installer
+
+    installer.finish(win.deps, ok=["deno"], failed=["yt-dlp", "ffmpeg"])
+    _settle(qapp)
+    assert win.added == []
+    # Names what must install: "once they're installed" would read as the links.
+    assert win.statusBar().currentMessage() == (
+        "yt-dlp and ffmpeg didn't install, so your links are still in the box. They start by "
+        "themselves once yt-dlp and ffmpeg are installed."
+    )
+
+    dialog.start_install(["yt-dlp"])  # the yt-dlp row's Download, in the tools window
+    installer.finish(win.deps, ok=["yt-dlp"])
+    _settle(qapp)
+    assert win.added == [], "ffmpeg, asked for and still missing: nothing starts behind the window"
+    assert win.url_edit.links() == LINKS
+    assert dialog.isVisible()
+    message = win.statusBar().currentMessage()
+    assert "ffmpeg didn't install" in message and "Click Download" in message
+    # ... and the tools window, the one in front, doesn't claim the opposite.
+    text = dialog._message.text()
+    assert "All set" not in text and "ffmpeg" in text
+
+    dialog.start_install(["ffmpeg"])  # ... and then ffmpeg's: everything asked for is there
+    installer.finish(win.deps, ok=["ffmpeg"])
+    _settle(qapp)
+    assert win.added == LINKS
+
+
+def test_links_started_by_hand_no_longer_wait_for_the_tools(qapp, make_window, prompts):
+    win = make_window()
+    prompts["answer"] = "Download"
+    win._start_downloads()
+    dialog = win._deps_dialog
+    dialog._installer.finish(win.deps, ok=["yt-dlp", "deno"], failed=["ffmpeg"])
+    _settle(qapp)
+    win._start_downloads()  # the user goes on without ffmpeg
+    assert win.added == LINKS
+
+    later = "https://example.com/watch?v=three"
+    win.url_edit.add_links([later])  # e.g. handed over by a second launch
+    dialog.start_install(["ffmpeg"])
+    dialog._installer.finish(win.deps, ok=["ffmpeg"])
+    _settle(qapp)
+    assert win.added == LINKS, "a link added afterwards waits for Download"
+    assert win.url_edit.links() == [later]
 
 
 def test_stop_that_came_too_late_says_stopped_not_all_set(qapp, make_window, prompts):
@@ -515,6 +596,64 @@ def test_first_run_window_fits_the_screen(qapp, make_window, monkeypatch, area, 
     assert area.contains(frame), f"{frame} starts off-screen"
 
 
+# --------------------------------------------------------------------------- quitting
+
+
+def _shutdowns(win: Any) -> list[bool]:
+    fired: list[bool] = []
+    win.shutdown_started.connect(lambda: fired.append(True))
+    return fired
+
+
+@pytest.mark.parametrize("installing", [False, True])
+def test_quitting_right_away_announces_the_shutdown_once(qapp, make_window, prompts, quits,
+                                                         installing):
+    win = make_window(installed=() if installing else TOOL_KEYS)
+    if installing:  # "A tool is still downloading. Stop it and quit?" -> Yes
+        prompts["answer"] = "Download"
+        win._start_downloads()
+        assert win._deps_dialog.busy
+    fired = _shutdowns(win)
+    win.close()
+    _settle(qapp)
+    assert fired == [True]
+    assert quits == [True]
+    assert not win.isVisible()
+
+
+def test_stop_them_and_quit_announces_the_shutdown_once(qapp, make_window, prompts, quits):
+    win = make_window(installed=TOOL_KEYS, real_queue=True)
+    win._start_downloads()
+    assert win.manager.has_work(), "precondition: downloads waiting"
+    fired = _shutdowns(win)
+
+    win.close()  # "Downloads are still running. Stop them and quit?" -> Yes
+    assert fired == [True], "as soon as it starts waiting for the downloads to stop"
+    _settle(qapp)  # they stopped: the window closes for real
+    assert fired == [True]
+    assert quits == [True]
+
+
+@pytest.mark.parametrize("installing", [False, True])
+def test_declined_quit_is_not_a_shutdown(qapp, make_window, prompts, quits, monkeypatch,
+                                         installing):
+    if installing:  # "A tool is still downloading. Stop it and quit?" -> No
+        win = make_window()
+        prompts["answer"] = "Download"
+        win._start_downloads()
+    else:  # "Downloads are still running. Stop them and quit?" -> No
+        win = make_window(installed=TOOL_KEYS, real_queue=True)
+        win._start_downloads()
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *_args, **_kwargs: QMessageBox.StandardButton.No)
+    fired = _shutdowns(win)
+    win.close()
+    _settle(qapp)
+    assert fired == []
+    assert quits == []
+    assert win.isVisible()
+
+
 # --------------------------------------------------------------------------- tools window
 
 
@@ -559,6 +698,75 @@ def test_tools_window_closes_after_installing_everything(qapp, theme_manager, se
         assert not dialog.isVisible()
     finally:
         dialog.deleteLater()
+
+
+def test_tools_window_says_all_set_only_when_nothing_is_missing(qapp, theme_manager, settings):
+    from ui.dialogs import DepsDialog
+
+    deps = StubDeps()
+    dialog = DepsDialog(deps, settings)
+    try:
+        dialog.show()
+        dialog.start_install(["yt-dlp"])  # one row's Download while ffmpeg and Deno are missing
+        dialog._installer.finish(deps, ok=["yt-dlp"])
+        assert dialog._message.text() == "Done. Still not installed: ffmpeg + ffprobe and Deno."
+        deps.checked.emit()  # the version check reports back later
+        assert dialog._message.text() == "Done. Still not installed: ffmpeg + ffprobe and Deno."
+        assert dialog.isVisible()
+
+        dialog.start_install(["ffmpeg", "deno"])
+        dialog._installer.finish(deps, ok=["ffmpeg", "deno"])
+        assert dialog._message.text() == "All set! Everything the app needs is installed."
+    finally:
+        dialog.deleteLater()
+
+
+# --------------------------------------------------------------------------- error details
+
+
+def _error_details() -> Any:
+    from core.errors import ACTION_COOKIES, FriendlyError
+    from ui.dialogs import ErrorDetailsDialog
+
+    error = FriendlyError("The site wants you to sign in.", "Use your browser's cookies, then retry.",
+                          ACTION_COOKIES, "ERROR: Sign in to confirm you're not a bot.")
+    dialog = ErrorDetailsDialog("A video", LINKS[0], error, "Use browser cookies")
+    dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)  # as the main window opens it
+    dialog.show()
+    return dialog
+
+
+@pytest.mark.parametrize("button", ["Close", "Retry", "Use browser cookies"])
+def test_closing_error_details_right_after_copy(qapp, monkeypatch, button):
+    import sys
+
+    import ui.dialogs
+    from PySide6.QtWidgets import QPushButton
+
+    errors: list[BaseException] = []
+    monkeypatch.setattr(sys, "excepthook", lambda _type, exc, _tb: errors.append(exc))
+    monkeypatch.setattr(ui.dialogs, "COPIED_FEEDBACK_MS", 20)
+    dialog = _error_details()
+    dialog._copy.click()
+    assert dialog._copy.text() == "Copied!"
+    next(b for b in dialog.findChildren(QPushButton) if b.text() == button).click()
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)  # the dialog is gone
+    QTest.qWait(100)  # longer than "Copied!" shows
+    assert errors == [], "no 'Internal C++ object already deleted' once the dialog is gone"
+
+
+def test_error_details_copy_button_reads_copy_again(qapp, monkeypatch):
+    import ui.dialogs
+
+    monkeypatch.setattr(ui.dialogs, "COPIED_FEEDBACK_MS", 20)
+    dialog = _error_details()
+    try:
+        dialog._copy.click()
+        assert dialog._copy.text() == "Copied!"
+        QTest.qWait(100)
+        assert dialog._copy.text() == "Copy"
+    finally:
+        dialog.close()
 
 
 # --------------------------------------------------------------------------- helpers
