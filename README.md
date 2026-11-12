@@ -8,7 +8,8 @@ Linux (X11 and Wayland). Paste a link, pick a preset, click **Download**. No ter
 - Up to 3 downloads at once, with progress, speed, ETA and status for each.
 - Plain-language error messages with a one-click fix (use browser cookies, pick another preset,
   download Deno or ffmpeg, update yt-dlp).
-- Follows the system light/dark theme; notifies you when the queue finishes.
+- Several designs to choose from (**Settings → Appearance**), each in light and dark mode,
+  following the system setting; notifies you when the queue finishes.
 
 ## Run from source
 
@@ -112,6 +113,24 @@ Note: when you run from source with the Microsoft Store version of Python, Windo
 that folder to `%LOCALAPPDATA%\Packages\PythonSoftwareFoundation.Python.3.x_…\LocalCache\Local\YtdlpDownloader`.
 The packaged app is not affected.
 
+## Appearance
+
+**Settings → Appearance** switches between UI designs instantly; the choice is remembered.
+Every design shows the same controls and works the same way — only the arrangement and
+style differ. Each design is a single file in `ui/variants/`; see
+[`ui/variants/README.md`](ui/variants/README.md) to change one or add your own.
+
+To preview every design without opening the app:
+
+```bash
+python tools/screenshots.py --sheet
+```
+
+This writes light/dark screenshots of each design (normal, Advanced + Log open, small
+window, empty) plus `contact-sheet.png` into `screenshots/`. Add `--check` to list layout
+problems (missing controls, cut-off text, overlaps) and `--switch-test` to switch through
+all designs live.
+
 ## Tips
 
 - **"Sign in to confirm you're not a bot" / age-restricted videos:** open Advanced options → Cookies from
@@ -126,9 +145,12 @@ The packaged app is not affected.
 
 ```
 main.py               entry point, theme, app setup
-ui/main_window.py     the main window
+ui/main_window.py     the main window: creates the controls, applies a design
+ui/variants/          one file per design (layout + colours); README.md explains the API
+ui/theme.py           design system: colours, metrics, base stylesheet, light/dark switching
+ui/kit.py             small helpers for writing design layouts
 ui/dialogs.py         dependency wizard, yt-dlp updater, error details, About
-ui/widgets.py         link box, collapsible sections, progress cells, error banner
+ui/widgets.py         link box, toggles, advanced panel, list cells, error banner
 ui/icon.py            app icon (drawn in code; `python -m ui.icon out.png` exports it)
 core/downloader.py    queue, QProcess handling, output parsing, cancel + cleanup
 core/deps.py          finding, version-checking and downloading the tools
@@ -138,6 +160,7 @@ core/process.py       child-process environment, no-console flags, process-tree 
 core/settings.py      settings JSON
 core/paths.py         app, config and tool folders
 presets.json          built-in presets
+tools/screenshots.py  renders and checks every design off-screen (developer tool)
 ```
 
 ## Legal

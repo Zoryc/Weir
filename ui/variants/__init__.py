@@ -27,6 +27,7 @@ VARIANT_MODULES: tuple[str, ...] = (
     "fluent",
     "large",
     "mono",
+    "studio",
 )
 
 
