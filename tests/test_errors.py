@@ -87,6 +87,7 @@ T_TOO_OLD = errors._TOO_OLD.title
 T_OUTDATED = errors._OUTDATED.title
 T_FORMAT = errors._FORMAT_UNAVAILABLE.title
 T_403 = errors._FORBIDDEN.title
+T_SITE_TROUBLE = errors._SITE_TROUBLE.title
 T_GENERIC = "The download failed."
 
 # (id, log lines, has_js_runtime, expected title, expected action)
@@ -344,6 +345,167 @@ def test_page_403_is_never_a_network_problem() -> None:
         for has_js, warnings in ((True, []), (True, [CHALLENGE_WARNING]), (False, [NO_JS_WARNING])):
             error = explain_error([COMMAND, *warnings, line], has_js_runtime=has_js)
             assert (error.title, error.action) == (T_403, ACTION_UPDATE), (what, warnings)
+
+
+def _page_error(status: str, what: str = "webpage") -> str:
+    """yt-dlp 2026.10.26's error when a page answers with an HTTP error status ("410: Gone")."""
+    return (f"ERROR: [generic] clip-42: Unable to download {what}: HTTP Error {status} "
+            f"(caused by <HTTPError {status}>)")
+
+
+# Statuses and reasons as yt-dlp.exe 2026.10.26 printed them for a local server.
+HTTP_STATUSES = [
+    "400: Bad Request", "401: Unauthorized", "402: Payment Required", "403: Forbidden", "404: Not Found",
+    "405: Method Not Allowed", "408: Request Timeout", "410: Gone", "418: I'm a Teapot",
+    "429: Too Many Requests", "451: Unavailable For Legal Reasons", "500: Internal Server Error",
+    "501: Not Implemented", "502: Bad Gateway", "503: Service Unavailable", "504: Gateway Timeout",
+    "520: None",
+]
+# The rest get the generic message: none of them is a network problem.
+HTTP_STATUS_ADVICE: dict[str, tuple[str, str | None]] = {
+    "401": (T_SIGN_IN, ACTION_COOKIES),
+    "403": (T_403, ACTION_UPDATE),
+    "404": (T_UNAVAILABLE, None),
+    "410": (T_UNAVAILABLE, None),
+    "429": (T_429, ACTION_COOKIES),
+    "451": (T_UNAVAILABLE, None),
+    **{status: (T_SITE_TROUBLE, None) for status in ("500", "501", "502", "503", "504", "520")},
+}
+
+
+@pytest.mark.parametrize("status", HTTP_STATUSES)
+def test_page_http_status(status: str) -> None:
+    expected = HTTP_STATUS_ADVICE.get(status[:3], (T_GENERIC, None))
+    error = explain_error([COMMAND, _page_error(status)], has_js_runtime=True)
+    assert (error.title, error.action) == expected
+
+
+@pytest.mark.parametrize("status", HTTP_STATUSES)
+def test_http_status_is_never_a_network_problem(status: str) -> None:
+    for what in ("webpage", "API page", "JSON metadata"):
+        for has_js, warnings in ((True, []), (True, [CHALLENGE_WARNING]), (False, [NO_JS_WARNING])):
+            line = _page_error(status, what)
+            error = explain_error([COMMAND, *warnings, line], has_js_runtime=has_js)
+            assert error.title != T_NETWORK, (what, warnings)
+        # Also when only a warning is left to go on.
+        warning = _page_error(status, what).replace("ERROR:", "WARNING:", 1)
+        error = explain_error([COMMAND, warning, "ERROR: something nobody has seen before"], has_js_runtime=True)
+        assert error.title != T_NETWORK, what
+
+
+def test_wifi_sign_in_page_is_a_network_problem() -> None:
+    # 511 comes from a captive portal (hotel or airport Wi-Fi), not from the site.
+    for line in (_page_error("511: Network Authentication Required"),
+                 "ERROR: \r[download] Got error: HTTP Error 511: Network Authentication Required. "
+                 "Giving up after 10 retries"):
+        error = explain_error([COMMAND, line], has_js_runtime=True)
+        assert error.title == T_NETWORK, line
+        assert "sign in to the network" in error.hint
+
+
+GETADDRINFO_ERROR = (
+    "ERROR: [youtube] abc123def45: Unable to download webpage: <urlopen error [Errno 11001] getaddrinfo "
+    "failed> (caused by TransportError('<urlopen error [Errno 11001] getaddrinfo failed>'))"
+)
+# Failures without an HTTP status: the first four as yt-dlp.exe 2026.10.26 printed them on
+# a French Windows (its requests handler), the rest in its urllib handler's "<urlopen error …>" form.
+NETWORK_ERRORS = [
+    pytest.param(
+        "ERROR: [generic] page: Unable to download webpage: HTTPConnection(host='127.0.0.1', port=8779): Failed "
+        "to establish a new connection: [WinError 10061] Aucune connexion n’a pu être établie car l’ordinateur "
+        "cible l’a expressément refusée (caused by TransportError(\"HTTPConnection(host='127.0.0.1', port=8779): "
+        "Failed to establish a new connection: [WinError 10061] Aucune connexion n’a pu être établie car "
+        "l’ordinateur cible l’a expressément refusée\"))",
+        id="refused-french",
+    ),
+    pytest.param(
+        "ERROR: [generic] page: Unable to download webpage: ('Connection aborted.', ConnectionResetError(10054, "
+        "'Une connexion existante a dû être fermée par l’hôte distant', None, 10054, None)) (caused by "
+        "TransportError(\"('Connection aborted.', ConnectionResetError(10054, 'Une connexion existante a dû être "
+        "fermée par l’hôte distant', None, 10054, None))\"))",
+        id="reset-french",
+    ),
+    pytest.param(
+        "ERROR: [generic] page: Unable to download webpage: ('Connection aborted.', RemoteDisconnected('Remote end "
+        "closed connection without response')) (caused by TransportError(\"('Connection aborted.', "
+        "RemoteDisconnected('Remote end closed connection without response'))\"))",
+        id="remote-disconnected",
+    ),
+    pytest.param(
+        "ERROR: [generic] page: Unable to download webpage: HTTPConnectionPool(host='127.0.0.1', port=8770): Read "
+        "timed out. (read timeout=3.0) (caused by TransportError(\"HTTPConnectionPool(host='127.0.0.1', "
+        "port=8770): Read timed out. (read timeout=3.0)\"))",
+        id="read-timeout",
+    ),
+    pytest.param(GETADDRINFO_ERROR, id="getaddrinfo"),
+    pytest.param(
+        "ERROR: [youtube] abc123def45: Unable to download webpage: <urlopen error [WinError 10060] A connection "
+        "attempt failed because the connected party did not properly respond after a period of time, or "
+        "established connection failed because connected host has failed to respond> (caused by "
+        "TransportError('<urlopen error [WinError 10060] A connection attempt failed because the connected party "
+        "did not properly respond after a period of time, or established connection failed because connected "
+        "host has failed to respond>'))",
+        id="winerror-10060",
+    ),
+    pytest.param(
+        "ERROR: [youtube] abc123def45: Unable to download webpage: <urlopen error [Errno -3] Temporary failure "
+        "in name resolution> (caused by TransportError('<urlopen error [Errno -3] Temporary failure in name "
+        "resolution>'))",
+        id="linux-name-resolution",
+    ),
+]
+
+
+@pytest.mark.parametrize("line", NETWORK_ERRORS)
+def test_network_failures_still_say_network(line: str) -> None:
+    for has_js, warnings in ((True, []), (True, [CHALLENGE_WARNING]), (False, [NO_JS_WARNING])):
+        error = explain_error([COMMAND, EXTRACTING, *warnings, line], has_js_runtime=has_js)
+        assert (error.title, error.action) == (T_NETWORK, None), warnings
+
+
+@pytest.mark.parametrize(("lines", "title", "action"), [
+    # The http downloader's own wording (the "\r" is in yt-dlp's output and kept in Weir's log).
+    pytest.param(["ERROR: unable to download video data: HTTP Error 410: Gone"], T_UNAVAILABLE, None,
+                 id="video-data-410"),
+    pytest.param(["ERROR: unable to download video data: HTTP Error 401: Unauthorized"], T_SIGN_IN,
+                 ACTION_COOKIES, id="video-data-401"),
+    pytest.param(["ERROR: \r[download] Got error: HTTP Error 503: Service Unavailable. Giving up after 10 retries"],
+                 T_SITE_TROUBLE, None, id="video-data-503"),
+    # A server error isn't explained by a warning about YouTube's challenges.
+    pytest.param([EXTRACTING, CHALLENGE_WARNING,
+                  "ERROR: [youtube] abc123def45: Unable to download API page: HTTP Error 500: Internal Server Error "
+                  "(caused by <HTTPError 500: Internal Server Error>)"], T_SITE_TROUBLE, None,
+                 id="api-page-500-after-challenge"),
+    # Only the latest attempt counts, in both directions.
+    pytest.param([COMMAND, GETADDRINFO_ERROR, COMMAND, _page_error("503: Service Unavailable")],
+                 T_SITE_TROUBLE, None, id="network-then-503"),
+    pytest.param([COMMAND, _page_error("503: Service Unavailable"), COMMAND, GETADDRINFO_ERROR],
+                 T_NETWORK, None, id="503-then-network"),
+    # A page error that was only a warning used to be called a network problem.
+    pytest.param([COMMAND, _page_error("400: Bad Request").replace("ERROR:", "WARNING:", 1),
+                  "ERROR: something nobody has seen before"], T_GENERIC, None, id="warning-400-then-unknown"),
+])
+def test_http_status_in_context(lines: list[str], title: str, action: str | None) -> None:
+    error = explain_error(lines, has_js_runtime=True)
+    assert (error.title, error.action) == (title, action)
+
+
+def test_401_asks_for_sign_in_and_names_the_cookies_used() -> None:
+    line = _page_error("401: Unauthorized")
+    error = explain_error([COMMAND, line], has_js_runtime=True)
+    assert (error.title, error.hint, error.action) == (T_SIGN_IN, errors._SIGN_IN.hint, ACTION_COOKIES)
+    error = explain_error([COMMAND, line], has_js_runtime=True, cookies_browser="firefox")
+    assert error.hint.startswith("Cookies from Firefox were used but didn't work")
+    assert error.action == ACTION_COOKIES
+    error = explain_error([COMMAND, line], has_js_runtime=True, cookies_browser="C:/me/cookies.txt")
+    assert "fresh cookies.txt" in error.hint
+
+
+@pytest.mark.parametrize("cookies", ["", "firefox"])
+def test_site_trouble_says_try_later_without_a_fix(cookies: str) -> None:
+    error = explain_error([COMMAND, _page_error("502: Bad Gateway")], has_js_runtime=True, cookies_browser=cookies)
+    assert (error.title, error.action) == (T_SITE_TROUBLE, None)
+    assert "Try again later" in error.hint and "internet" not in error.hint
 
 
 def test_details_keep_the_raw_log() -> None:

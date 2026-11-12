@@ -157,7 +157,7 @@ _SIGN_IN = _Rule(
     ("sign in to confirm you", "confirm you're not a bot", "confirm you’re not a bot",
      "confirm your age", "age-restricted", "age restricted", "inappropriate for some users",
      "use --cookies-from-browser", "use --cookies", "login required", "this video is only available for registered users",
-     "members-only", "join this channel", "requires authentication"),
+     "members-only", "join this channel", "requires authentication", "http error 401"),
     "The site wants you to sign in.",
     "Open Advanced options → Cookies from and pick the browser where you're signed in "
     "(Firefox works best), then retry.",
@@ -180,7 +180,8 @@ _UNAVAILABLE = _Rule(
      # YouTube: "The uploader has not made this video available in your country".
      "not available in your country", "made this video available in your country",
      "blocked it in your country", "geo restrict",
-     "has been terminated", "account associated with this video has been terminated", "http error 404"),
+     "has been terminated", "account associated with this video has been terminated", "http error 404",
+     "http error 410", "http error 451"),
     "This video is unavailable.",
     "It may be private, deleted, or blocked in your country. Check that the link opens in your browser.",
 )
@@ -209,10 +210,9 @@ _FORBIDDEN_HINT = (
     "Update yt-dlp (Settings → Update yt-dlp) and retry. Using cookies from your browser can also help."
 )
 # The site refused a page yt-dlp needed ("Unable to download webpage: HTTP Error
-# 403: Forbidden", "… API page …", "… JSON metadata …"). It must come before
-# _NETWORK, whose "unable to download webpage" would call it a network problem.
-# Refused video data ("unable to download video data: HTTP Error 403") is left
-# to _FORBIDDEN, last in _RULES, as a failed YouTube challenge often explains it.
+# 403: Forbidden", "… API page …", "… JSON metadata …"). Refused video data
+# ("unable to download video data: HTTP Error 403") is left to _FORBIDDEN, last
+# in _RULES, as a failed YouTube challenge often explains it.
 _FORBIDDEN_PAGE = _Rule(
     (),
     _FORBIDDEN_TITLE,
@@ -220,12 +220,31 @@ _FORBIDDEN_PAGE = _Rule(
     ACTION_UPDATE,
     pattern=re.compile(r"unable to download (?!video data\b)[^:]*: http error 403\b"),
 )
+# A 5xx answer: the site's servers failed ("Unable to download webpage: HTTP Error
+# 503: Service Unavailable", or "Got error: HTTP Error 502: Bad Gateway. Giving up
+# after 10 retries" for video data). Ahead of the yt-dlp rules below: a warning
+# about YouTube's challenges doesn't explain a server error. Not 511 "Network
+# Authentication Required": that comes from a Wi-Fi sign-in page, see _NETWORK.
+_SITE_TROUBLE = _Rule(
+    (),
+    "The site is having trouble right now.",
+    "This is a problem on the site's side, not on your computer. Try again later.",
+    pattern=re.compile(r"http error 5(?!11\b)\d\d\b"),
+)
+# "Unable to download webpage: …" is a network problem only when no HTTP status
+# follows: with one ("…: HTTP Error 410: Gone") the site did answer, and the
+# status has its own rule above or gets the generic message. Without one it is
+# often the only sign, as the cause can be in the user's language ("[WinError
+# 10061] Aucune connexion n'a pu être établie…") or a bare "ConnectionResetError".
 _NETWORK = _Rule(
-    ("unable to download webpage", "getaddrinfo failed", "name or service not known",
+    ("http error 511", "network authentication required",  # Wi-Fi not signed in to yet
+     "getaddrinfo failed", "name or service not known",
      "temporary failure in name resolution", "network is unreachable", "connection refused",
      "connection reset", "timed out", "unable to connect", "nodename nor servname"),
     "Network problem.",
-    "Check your internet connection and retry.",
+    "Check your internet connection and retry. On public Wi-Fi, open any web page in your "
+    "browser first and sign in to the network if it asks.",
+    pattern=re.compile(r"unable to download webpage(?!: http error \d)"),
 )
 
 # -- yt-dlp itself (also trusted when they only appear as a WARNING) ------------
@@ -302,6 +321,7 @@ _RULES: tuple[_Rule, ...] = (
     _INVALID_URL,
     _RATE_LIMITED,
     _FORBIDDEN_PAGE,
+    _SITE_TROUBLE,
     _NETWORK,
     _NEEDS_DENO,
     _TOO_OLD,
