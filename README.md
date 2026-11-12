@@ -4,6 +4,10 @@ A video and music downloader for Windows 10/11 and Linux (X11 and Wayland), buil
 [yt-dlp](https://github.com/yt-dlp/yt-dlp). Paste a link, pick a preset, click **Download**.
 No terminal needed.
 
+**[Download the latest version](https://github.com/Zoryc/Weir/releases/latest)**
+
+![Weir in dark mode](docs/weir-dark.png)
+
 - One screen, laid out as numbered steps: **01 Source** (paste or drag & drop links),
   **02 Format**, **03 Output**, **04 Run**, with the download queue underneath.
 - First-run wizard downloads the tools it needs (yt-dlp, ffmpeg + ffprobe, Deno) with one click.
@@ -14,10 +18,13 @@ No terminal needed.
 
 ## Install
 
+Get the files from the [Releases page](https://github.com/Zoryc/Weir/releases/latest).
+
 **Windows:** run `Weir-Setup-<version>.exe`. It installs for your user account only (no
 administrator password), adds Weir to the Start menu (and optionally the desktop) and
 appears in *Settings → Apps* for uninstalling. The setup is in English or French depending
-on your system.
+on your system. The installer isn't code-signed yet, so Windows may show *"Windows protected
+your PC"*: click **More info → Run anyway**.
 
 **Linux:** download `Weir-<version>-x86_64.AppImage`, make it executable (right-click →
 Properties → *Allow executing as program*, or `chmod +x Weir-*.AppImage`) and double-click
@@ -173,7 +180,19 @@ installer/weir.iss    Inno Setup script for the Windows installer
 tools/screenshots.py  off-screen screenshots + layout checks
 ```
 
-## Legal
+## Releasing
 
-yt-dlp is released under the Unlicense, the FFmpeg builds under the GPL, Deno under the MIT
-license. Only download content you have the right to download.
+1. Set `APP_VERSION` in `core/__init__.py` and add a `## <version> — <date>` section to
+   `CHANGELOG.md`.
+2. Commit, then tag and push: `git tag v<version>` and `git push origin main v<version>`.
+
+The *Release* workflow builds the Windows installer and the Linux AppImage on GitHub and
+publishes them with the changelog section as release notes.
+
+## License
+
+Weir is released under the [MIT License](LICENSE).
+
+It downloads and runs separate programs that keep their own licenses: yt-dlp (Unlicense), the
+FFmpeg builds (GPL) and Deno (MIT). The app bundles Qt for Python (PySide6, LGPL). Only
+download content you have the right to download.

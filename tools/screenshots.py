@@ -43,6 +43,8 @@ from PySide6.QtWidgets import (  # noqa: E402
 from core import APP_NAME  # noqa: E402
 
 SIZE_DEFAULT = (1040, 820)
+# A neutral folder for the pictures (they end up in the README; no real user names in them).
+DEMO_FOLDER = "C:\\Users\\you\\Downloads" if sys.platform == "win32" else "/home/you/Downloads"
 SIZE_SMALL = (820, 620)
 
 
@@ -62,12 +64,12 @@ def _populate_demo(win) -> None:  # noqa: ANN001 - MainWindow, imported lazily
         "https://www.youtube.com/playlist?list=PLx0sYbCqOb8TBPRdmBHs5Iftvv9TPboYG",
     ])
     p = win.presets.builtin
-    opts = DownloadOptions(str(Path.home() / "Downloads"), False, False, True, [], "%(title)s.%(ext)s", "", "")
+    opts = DownloadOptions(DEMO_FOLDER, False, False, True, [], "%(title)s.%(ext)s", "", "")
     demo = [
         ("Lofi beats to study to – 1 hour mix 🎧", p[4], JobStatus.DOWNLOADING, 63.4, "4.21MiB/s", "00:12", []),
         ("東京の夜景 4K ドローン映像", p[3], JobStatus.CONVERTING, 100.0, "", "", []),
         ("Café de Flore — live session", p[0], JobStatus.DONE, 100.0, "", "",
-         [str(Path.home() / "Downloads" / "Café de Flore — live session.mp4")]),
+         [str(Path(DEMO_FOLDER) / "Café de Flore — live session.mp4")]),
         ("", p[1], JobStatus.ERROR, 0.0, "", "", []),
         ("", p[2], JobStatus.WAITING, 0.0, "", "", []),
     ]
@@ -211,7 +213,7 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     settings = Settings()
     settings._normalize()
-    settings.save_dir = str(Path.home() / "Downloads")
+    settings.save_dir = DEMO_FOLDER
     tm = ThemeManager(app, DESIGN)
     win = MainWindow(settings, PresetStore.load(), DepsManager(), tm)
     win.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
