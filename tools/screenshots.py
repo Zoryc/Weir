@@ -169,6 +169,55 @@ def check_layout(win, label: str) -> list[str]:  # noqa: ANN001
     return [f"[{label}] {issue}" for issue in issues]
 
 
+def part_state(win) -> dict[str, tuple]:  # noqa: ANN001
+    """Everything about the shared parts a variant could leave behind when it is replaced."""
+    from PySide6.QtWidgets import QPlainTextEdit
+
+    state: dict[str, tuple] = {}
+    for name, widget in win.parts.items():
+        props = tuple(sorted(bytes(p.data()).decode() for p in widget.dynamicPropertyNames()
+                             if not bytes(p.data()).startswith(b"_q_")))
+        extra: tuple = ()
+        if isinstance(widget, QLabel):
+            extra = (int(widget.alignment().value), widget.wordWrap())
+        elif isinstance(widget, QLineEdit):
+            extra = (int(widget.alignment().value), len(widget.actions()))
+        elif isinstance(widget, QPlainTextEdit):
+            extra = (int(widget.lineWrapMode().value), widget.viewportMargins().top(),
+                     int(widget.horizontalScrollBarPolicy().value), int(widget.verticalScrollBarPolicy().value))
+        state[name] = (
+            widget.font().toString(), widget.styleSheet(), widget.graphicsEffect() is not None,
+            int(widget.layoutDirection().value), int(widget.focusPolicy().value),
+            int(widget.cursor().shape().value), props, extra, widget.objectName(), widget.isWindow(),
+        )
+    header = win.queue.header()
+    state["queue.columns"] = tuple(
+        (win.queue.columnWidth(c), int(header.sectionResizeMode(c).value), win.queue.isColumnHidden(c))
+        for c in range(win.queue.columnCount())
+    )
+    state["queue.view"] = (int(win.queue.horizontalScrollBarPolicy().value),
+                           int(win.queue.verticalScrollBarPolicy().value), win.queue.indentation())
+    state["preset_combo.contents"] = (win.preset_combo.minimumContentsLength(),)
+    return state
+
+
+def _exercise(app: QApplication, win) -> None:  # noqa: ANN001
+    """Poke the window the way a user would, so stray event filters get a chance to misbehave."""
+    for size in ((900, 700), SIZE_DEFAULT):
+        win.resize(*size)
+        _settle(app, 2)
+    for expanded in (True, False):
+        win.advanced_toggle.setChecked(expanded)
+        win.log_toggle.setChecked(expanded)
+        _settle(app, 2)
+    for widget in (win.url_edit, win.folder_edit, win.preset_combo, win.url_edit):
+        widget.setFocus()
+        _settle(app, 1)
+    for job in win.manager.jobs():
+        win.manager.job_changed.emit(job.id)
+    _settle(app, 2)
+
+
 # ------------------------------------------------------------------- render
 
 def render_variant(app: QApplication, tm, win, variant, out: Path, check: bool) -> list[str]:  # noqa: ANN001
@@ -289,15 +338,34 @@ def main() -> int:
     problems: list[str] = []
     try:
         if args.switch_test:
+            errors: list[str] = []
+            previous_hook = sys.excepthook
+            sys.excepthook = lambda t, e, tb: errors.append(f"{t.__name__}: {e}")  # Qt callbacks report here
             _populate_demo(win)
+            first = available_variants()[0]
+            tm.set_variant(first)
+            _exercise(app, win)
+            baseline = part_state(win)
             for v in list(available_variants()) * 2:  # twice: switching back must work too
+                before = len(errors)
                 tm.set_variant(v)
                 for scheme in ("light", "dark"):
                     tm.force_scheme(scheme)
                     _settle(app, 3)
                     problems += check_layout(win, f"switch {v.key} {scheme}")
+                _exercise(app, win)
+                tm.set_variant(first)  # come back and compare: nothing may stay behind
+                _exercise(app, win)
+                after = part_state(win)
+                for key, value in baseline.items():
+                    if after.get(key) != value:
+                        problems.append(f"[leak {v.key}] {key} differs after switching back: "
+                                        f"{value!r} -> {after.get(key)!r}")
+                problems += [f"[error {v.key}] {e}" for e in errors[before:]]
             tm.force_scheme(None)
-            print(f"switched through {len(available_variants())} variants twice")
+            sys.excepthook = previous_hook
+            print(f"switched through {len(available_variants())} variants twice "
+                  f"(leak + error check against {first.key})")
         else:
             for v in variants:
                 problems += render_variant(app, tm, win, v, out, args.check)
@@ -305,9 +373,13 @@ def main() -> int:
             if args.sheet:
                 print("sheet:", contact_sheet(list(available_variants()), out))
     finally:
+        import shiboken6
+
         win._force_close = True
         win.close()
         _settle(app, 2)
+        shiboken6.delete(win)  # tear Qt down while Python is still fully alive
+        _settle(app, 1)
         for location in (QStandardPaths.StandardLocation.AppConfigLocation,
                          QStandardPaths.StandardLocation.CacheLocation):
             folder = QStandardPaths.writableLocation(location)

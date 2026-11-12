@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import sys
 import traceback
+
+import shiboken6
 from types import TracebackType
 
 from PySide6.QtGui import QGuiApplication
@@ -84,7 +86,11 @@ def main() -> int:
         window.url_edit.add_links(links)
     window.show()
     deps.refresh()  # version checks run in a background thread
-    return app.exec()
+    code = app.exec()
+    # Destroy the window while Python is still fully alive: some UI variants use Python
+    # layout classes that Qt calls into while it tears widgets down.
+    shiboken6.delete(window)
+    return code
 
 
 if __name__ == "__main__":

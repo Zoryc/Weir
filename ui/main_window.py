@@ -987,7 +987,9 @@ class MainWindow(QMainWindow):
         item.setForeground(COL_SPEED, muted)
         item.setForeground(COL_ETA, muted)
         item.setText(COL_STATUS, self._status_text(job))
-        item.setData(COL_STATUS, ACCENT_ROLE, color)
+        # The pill draws its text in this colour, so use the readable text variant of the accent.
+        item.setData(COL_STATUS, ACCENT_ROLE,
+                     theme.current().color("accent_text") if color == theme.current().color("accent") else color)
         item.setToolTip(COL_STATUS, f"{job.error.title}\n{job.error.hint}" if job.error else "")
 
     def _refresh_summary(self) -> None:

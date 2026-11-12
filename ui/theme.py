@@ -45,6 +45,13 @@ class Theme:
     danger: str
     scroll: str  # scrollbar handle
     on_accent: str = "#ffffff"  # text/icons drawn on the accent colour
+    # Accent used as text on card/window backgrounds (status pills, link-style hovers).
+    # Defaults to `accent`; set it when the accent is too light or too dark to read as text.
+    accent_text: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.accent_text:
+            object.__setattr__(self, "accent_text", self.accent)
 
     def color(self, name: str) -> QColor:
         return QColor(getattr(self, name))
@@ -127,7 +134,7 @@ def build_palette(t: Theme) -> QPalette:
         QPalette.ColorRole.Button: t.card,
         QPalette.ColorRole.ButtonText: t.text,
         QPalette.ColorRole.BrightText: t.danger,
-        QPalette.ColorRole.Link: t.accent,
+        QPalette.ColorRole.Link: t.accent_text,
         QPalette.ColorRole.Highlight: t.accent,
         QPalette.ColorRole.HighlightedText: t.on_accent,
         QPalette.ColorRole.Light: t.card,
@@ -208,14 +215,14 @@ QPushButton#accentSmall {{ background: {t.accent}; color: {t.on_accent}; border:
 QPushButton#accentSmall:hover {{ background: {t.accent_hover}; }}
 QPushButton#accentSmall:pressed {{ background: {t.accent_pressed}; }}
 QPushButton#flat {{ background: transparent; border: none; color: {t.muted}; padding: 4px 8px; }}
-QPushButton#flat:hover {{ color: {t.accent}; background: {t.accent_soft}; }}
+QPushButton#flat:hover {{ color: {t.accent_text}; background: {t.accent_soft}; }}
 QPushButton#flat:disabled {{ color: {t.border_strong}; background: transparent; }}
 
 QToolButton#sectionToggle {{
     background: transparent; border: none; color: {t.muted};
     font-weight: 600; padding: 4px 6px 4px 2px;
 }}
-QToolButton#sectionToggle:hover {{ color: {t.accent}; }}
+QToolButton#sectionToggle:hover {{ color: {t.accent_text}; }}
 QToolButton#menuButton {{
     background: {t.card}; color: {t.text}; border: {bw}px solid {t.border_strong};
     border-radius: {m.control_radius}px; padding: {bv}px 28px {bv}px 12px;
@@ -318,6 +325,13 @@ QFrame#errorBanner QLabel {{ background: transparent; }}
 """
 
 
+_PLATFORM_FONT_CLASSES: tuple[str, ...] = (
+    "QAbstractItemView", "QListView", "QTreeView", "QHeaderView", "QMenu", "QMenuBar",
+    "QMessageBoxLabel", "QTipLabel", "QStatusBar", "QPushButton", "QCheckBox", "QRadioButton",
+    "QToolButton", "QComboMenuItem", "QComboLineEdit", "QDockWidgetTitle", "QMdiSubWindowTitleBar",
+)
+
+
 class ThemeManager(QObject):
     """Applies the active variant and re-applies it when the system light/dark setting changes."""
 
@@ -376,11 +390,6 @@ class ThemeManager(QObject):
         m = v.metrics
         _theme, _metrics, _variant = t, m, v
 
-        font = QFont(self._system_font)
-        if m.font_families:
-            font.setFamilies(list(m.font_families))
-        font.setPointSizeF(m.font_size)
-        self._app.setFont(font)
         self._app.setPalette(build_palette(t))
         glyphs = {
             "chevron": self._glyph_file("chevron", t.muted),
@@ -392,4 +401,14 @@ class ThemeManager(QObject):
         if v.extra_qss is not None:
             qss += "\n" + v.extra_qss(t, m, self._glyph_file)
         self._app.setStyleSheet(qss)
+
+        # Fonts last: installing a stylesheet style reloads the platform's per-class fonts
+        # (Windows: Segoe UI 9 for lists, headers and menus), which would override ours.
+        font = QFont(self._system_font)
+        if m.font_families:
+            font.setFamilies(list(m.font_families))
+        font.setPointSizeF(m.font_size)
+        self._app.setFont(font)
+        for class_name in _PLATFORM_FONT_CLASSES:
+            self._app.setFont(font, class_name)
         self.changed.emit()

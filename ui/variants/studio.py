@@ -69,6 +69,7 @@ LIGHT = Theme(
     danger="#d93025",
     scroll="#c3cad3",
     on_accent="#10150c",
+    accent_text="#3f6f00",  # lime is too light to read as text on white
 )
 
 # Lime is too light for text on white: use a deep olive for accent-coloured text in light mode.
