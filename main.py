@@ -77,6 +77,16 @@ def _show_handed_over_links(window: MainWindow, links: list[str]) -> None:
     window.activateWindow()
 
 
+def _answer_new_launches(instance: SingleInstance, window: MainWindow) -> None:
+    """Pass later launches on to the window, until it starts quitting."""
+    instance.activation_requested.connect(
+        lambda received: _show_handed_over_links(window, received)
+    )
+    # Links handed to a window that is closing would be lost: from then on a new launch
+    # waits for this Weir to exit and then starts fresh.
+    window.shutdown_started.connect(instance.stop_listening)
+
+
 def main() -> int:
     sanitize_inherited_environment()
     _set_windows_app_id()
@@ -105,16 +115,16 @@ def main() -> int:
     window = MainWindow(settings, presets, deps, theme)
     if links:
         window.url_edit.add_links(links)
-    instance.activation_requested.connect(
-        lambda received: _show_handed_over_links(window, received)
-    )
+    _answer_new_launches(instance, window)
     window.show()
     deps.refresh()  # version checks run in a background thread
     code = app.exec()
-    instance.close()  # a launch from now on starts fresh instead of waiting for us
+    instance.stop_listening()  # in case Weir quit without the window announcing it
     # Destroy the window while Python is still fully alive, so Qt never calls back into
     # half-torn-down Python objects (event filters, overridden methods) at exit.
     shiboken6.delete(window)
+    # Last: a launch that is waiting for this Weir to exit starts as soon as this is free.
+    instance.release()
     return code
 
 
