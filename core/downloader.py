@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from PySide6.QtCore import QObject, QProcess, Signal
 
@@ -52,6 +53,24 @@ MEDIA_EXTENSIONS = frozenset({
     "mp3", "mp4", "oga", "ogg", "opus", "ts", "wav", "weba", "webm",
 })
 KEEP_INTERMEDIATE_ARGS = frozenset({"-k", "--keep-video"})
+# Link parameters that only record where a link was shared from (YouTube's Share button adds a
+# new ?si= value every time); they never change what yt-dlp downloads. utm_* is matched by prefix.
+TRACKING_PARAMS = frozenset({"si", "feature", "pp", "fbclid", "gclid", "igshid"})
+# Hosts (after dropping "www."/"m.") whose video links all come down to an 11-character video id.
+YOUTUBE_HOSTS = frozenset({"youtube.com", "music.youtube.com", "youtu.be", "youtube-nocookie.com"})
+YOUTUBE_ID_PATHS = frozenset({"shorts", "live", "embed"})  # youtube.com/<this>/<video id>
+YOUTUBE_ID_RE = re.compile(r"[0-9A-Za-z_-]{11}")
+# 11-character words that look like a video id but aren't one (yt-dlp excludes the same two):
+# /embed/videoseries?list=... is a playlist player and /embed/live_stream?channel=... is a
+# channel's current live stream, so these links fall back to the plain key with list=/channel=.
+YOUTUBE_NOT_IDS = frozenset({"videoseries", "live_stream"})
+# A #fragment that only gives a start time (vimeo.com/ID#t=10s). Other fragments are kept: on
+# hash-routed sites they pick the song or station (music.163.com/#/song?id=..., radiko.jp/#!/live/QRR).
+TIME_FRAGMENT_RE = re.compile(r"t=(?:npt:)?[0-9hms:.,]*", re.IGNORECASE)
+SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+# A link typed without "https://" ("youtu.be/ID"), which yt-dlp still accepts. Requiring a dot
+# keeps bare video ids and "ytsearch:" queries out: they are compared as typed.
+BARE_HOST_RE = re.compile(r"[^\s/?#:@]+\.[^\s/?#:@]+(?::\d+)?(?:[/?#]|$)")
 
 
 class JobStatus(str, Enum):
@@ -151,6 +170,19 @@ class DownloadJob:
     used_js_runtime: bool = False
     _buffer: bytes = b""
     _destinations: list[_Destination] = field(default_factory=list)
+    _link_keys: dict[bool, str] = field(default_factory=dict, init=False, repr=False)
+
+    def link_key(self, keep_list: bool = True) -> str:
+        """_link_key(self.url, keep_list), worked out once per job.
+
+        find_active compares a pasted link with every queued job, once per pasted link;
+        parsing all their links every time froze the window when hundreds were pasted.
+        The link of a job never changes, so the key can be kept.
+        """
+        key = self._link_keys.get(keep_list)
+        if key is None:
+            key = self._link_keys[keep_list] = _link_key(self.url, keep_list)
+        return key
 
     @property
     def is_active(self) -> bool:
@@ -239,8 +271,79 @@ def _parse_percent(text: str) -> float | None:
         return None
 
 
-def _norm_url(url: str) -> str:
-    return url.strip().rstrip("/")
+def _link_key(url: str, keep_list: bool = True) -> str:
+    """A key that is the same for links that download the same thing.
+
+    Links to one video often differ: a new ?si= on every Share, youtu.be/ID vs watch?v=ID vs
+    /shorts/ID, "www." or "m." hosts, a #t= start time or a trailing "/". Two downloads of
+    such links into one folder write the same files, so they must be seen as the same link.
+    YouTube's list= is kept (with “Download whole playlist” on, watch?v=X&list=Y fetches the
+    whole playlist) unless keep_list is False. Never raises; odd text is compared as typed.
+    When unsure, links stay different: a wrong match throws a link away as a duplicate.
+    """
+    text = url.strip().rstrip("/")
+    link = text
+    if not SCHEME_RE.match(text):
+        if not BARE_HOST_RE.match(text):
+            return text
+        link = "//" + text  # so urlsplit reads "youtu.be" as the host, not as a path
+    try:
+        parts = urlsplit(link)
+    except ValueError:  # e.g. an unclosed "[" or a host with look-alike Unicode slashes
+        return text
+    # http, https and no scheme at all fetch the same page and write the same files.
+    scheme = parts.scheme.lower()
+    if scheme in ("http", "https"):
+        scheme = ""
+    userinfo, at, host = parts.netloc.rpartition("@")
+    host = host.lower()
+    for prefix in ("www.", "m."):
+        if host.startswith(prefix) and "." in host[len(prefix):]:
+            host = host[len(prefix):]
+            break
+    path = parts.path.rstrip("/")
+    params = [
+        p for p in parts.query.split("&")
+        if p and not _is_tracking_param(p.partition("=")[0])
+    ]
+    fragment = parts.fragment
+    if host in YOUTUBE_HOSTS:
+        fragment = ""  # YouTube never puts what to play after "#" (#comments, #t=...)
+        video = _youtube_video_id(host, path, params)
+        if video:
+            # The other parameters (t=, start=, index=, ...) don't change what yt-dlp downloads.
+            lists = [p.partition("=")[2] for p in params if p.partition("=")[0] == "list"]
+            if keep_list and lists and lists[0]:
+                return f"youtube:{video}?list={lists[0]}"
+            return f"youtube:{video}"
+    elif TIME_FRAGMENT_RE.fullmatch(fragment):
+        fragment = ""
+    # Parameter order never changes the page; a stable sort keeps repeated names in order.
+    params.sort(key=lambda p: p.partition("=")[0])
+    query = f"?{'&'.join(params)}" if params else ""
+    fragment = f"#{fragment}" if fragment else ""
+    return f"{scheme}://{userinfo}{at}{host}{path}{query}{fragment}"
+
+
+def _is_tracking_param(name: str) -> bool:
+    name = name.lower()
+    return name in TRACKING_PARAMS or name.startswith("utm_")
+
+
+def _youtube_video_id(host: str, path: str, params: list[str]) -> str:
+    """The video id of a YouTube video link, or "" for other YouTube pages (playlists, channels)."""
+    segments = [s for s in path.split("/") if s]
+    if host == "youtu.be":
+        candidate = segments[0] if len(segments) == 1 else ""
+    elif len(segments) == 1 and segments[0].lower() == "watch":
+        candidate = next((p.partition("=")[2] for p in params if p.partition("=")[0] == "v"), "")
+    elif len(segments) == 2 and segments[0].lower() in YOUTUBE_ID_PATHS:
+        candidate = segments[1]
+    else:
+        return ""
+    if candidate in YOUTUBE_NOT_IDS or not YOUTUBE_ID_RE.fullmatch(candidate):
+        return ""
+    return candidate
 
 
 def _norm_path(path: str, base: str = "") -> str:
@@ -374,10 +477,12 @@ class DownloadManager(QObject):
     def find_active(self, url: str, save_dir: str, preset: Preset | None = None) -> int | None:
         """Id of a waiting or running download of the same link into the same folder, if any.
 
+        Links count as the same when they lead to the same download (see _link_key), so a
+        second Share link of a video (another ?si=) is caught too.
         With a preset, only downloads with the same yt-dlp options count: the same video
         as MP4 and as MP3 is fine (they take turns, see _target_busy).
         """
-        wanted_url = _norm_url(url)
+        wanted_url = _link_key(url)
         wanted_dir = _norm_path(save_dir)
         for job in self._jobs.values():
             running = job.process is not None and not job.cancel_requested
@@ -385,7 +490,7 @@ class DownloadManager(QObject):
                 continue
             if preset is not None and job.preset.args != preset.args:
                 continue
-            if _norm_url(job.url) == wanted_url and _norm_path(job.options.save_dir) == wanted_dir:
+            if job.link_key() == wanted_url and _norm_path(job.options.save_dir) == wanted_dir:
                 return job.id
         return None
 
@@ -463,14 +568,16 @@ class DownloadManager(QObject):
         """True while another download of the same link into the same folder runs.
 
         Two presets of one video (MP4 and MP3, say) download the same streams under the
-        same temporary names, so the second one waits for the first to finish.
+        same temporary names, so the second one waits for the first to finish. YouTube's
+        list= is ignored here: watch?v=X&list=Y fetches video X too (alone when “Download
+        whole playlist” is off), so it would write X's files at the same time.
         """
-        url = _norm_url(job.url)
+        url = job.link_key(keep_list=False)
         folder = _norm_path(job.options.save_dir)
         return any(
             other is not job
             and other.process is not None
-            and _norm_url(other.url) == url
+            and other.link_key(keep_list=False) == url
             and _norm_path(other.options.save_dir) == folder
             for other in self._jobs.values()
         )
