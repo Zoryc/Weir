@@ -20,15 +20,17 @@ from pathlib import Path
 
 import pytest
 import shiboken6
-from PySide6.QtCore import QDir, QLockFile, QTimer
+from PySide6.QtCore import QLockFile, QTimer
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtTest import QTest
 
 from core import single_instance
-from core.single_instance import HandOver, SingleInstance, decode_links, encode_links
+from core.single_instance import (HandOver, SingleInstance, decode_message, encode_message,
+                                  socket_address)
 
 ROOT = Path(__file__).resolve().parent.parent
 LINKS = ["https://www.youtube.com/watch?v=abc", "https://vimeo.com/123", "https://example.com/é"]
+TOKEN = "2c5a9f1e-7d3b-4a8e-9c1f-0b6d4e2a8f37_TIME1234"  # like a desktop's activation token
 
 
 def _unique_name() -> str:
@@ -46,6 +48,11 @@ def _spin_until(condition: Callable[[], bool], ms: int = 5000) -> bool:
     while not condition() and time.monotonic() < end:
         QTest.qWait(10)
     return condition()
+
+
+def _record(instance: SingleInstance, received: list[list[str]]) -> None:
+    """Collect the links ``instance`` is handed (without the activation tokens)."""
+    instance.activation_requested.connect(lambda links, _token: received.append(links))
 
 
 def _deliveries(received: Sequence[Sequence[str]]) -> list[list[str]]:
@@ -88,7 +95,10 @@ def make_instance(qapp, tmp_path) -> Iterator[Callable[..., SingleInstance]]:
     created: list[SingleInstance] = []
 
     def make(name: str, wait_ms: int = 5000, lock_path: Path | None = None) -> SingleInstance:
-        lock = lock_path or tmp_path / f"{name}.lock"
+        # Off Windows a server_name is an absolute socket path, and tmp_path / "/run/..."
+        # would drop tmp_path: name the lock after the last part, so make(name) and
+        # make(first.server_name) share one lock in tmp_path on every system.
+        lock = lock_path or tmp_path / f"{Path(name).name}.lock"
         instance = SingleInstance(name, lock_path=lock, wait_ms=wait_ms)
         created.append(instance)
         return instance
@@ -104,7 +114,7 @@ def running(make_instance) -> tuple[SingleInstance, list[list[str]]]:
     first = make_instance(_unique_name())
     assert first.start() is False
     received: list[list[str]] = []
-    first.activation_requested.connect(received.append)
+    _record(first, received)
     return first, received
 
 
@@ -185,7 +195,7 @@ def test_host_name_change_while_weir_runs_does_not_start_a_second_weir(qapp, mon
         assert first.start() is False
         assert first.holds_lock and first.is_listening
         received: list[list[str]] = []
-        first.activation_requested.connect(received.append)
+        _record(first, received)
 
         computer.host = "dhcp-10-0-0-7.example.net"  # Wi-Fi connected
         second = SingleInstance(name, wait_ms=5000)
@@ -199,10 +209,140 @@ def test_host_name_change_while_weir_runs_does_not_start_a_second_weir(qapp, mon
             instance.release()
 
 
-def test_links_round_trip() -> None:
-    assert decode_links(encode_links(LINKS)[:-1]) == LINKS
-    assert encode_links([]) == b"\0"
-    assert decode_links(encode_links([" ", ""])[:-1]) == []
+def test_message_round_trip() -> None:
+    assert decode_message(encode_message(LINKS)[:-1]) == (LINKS, "")
+    assert encode_message([]) == b"\0"
+    assert decode_message(encode_message([" ", ""])[:-1]) == ([], "")
+    assert decode_message(encode_message(LINKS, TOKEN)[:-1]) == (LINKS, TOKEN)
+    assert decode_message(encode_message([], TOKEN)[:-1]) == ([], TOKEN)
+
+
+def test_message_from_a_launch_before_the_token_still_reads() -> None:
+    assert decode_message(b"https://a.example/1\nhttps://b.example/2") == (
+        ["https://a.example/1", "https://b.example/2"], "")
+
+
+def test_weir_from_before_the_token_finds_only_the_links() -> None:
+    """An update can leave an older Weir running: it takes every line for text that may
+    hold links, and must find none in the token line."""
+    from ui.widgets import extract_links_from_text
+
+    data = encode_message(LINKS, TOKEN)[:-1]
+    lines = [line.strip() for line in data.decode("utf-8").splitlines() if line.strip()]
+    assert extract_links_from_text("\n".join(lines)) == LINKS
+
+
+@pytest.mark.parametrize("token", ["two\nlines", "with space", "bell\x07", "é", "x" * 5000])
+def test_what_cannot_be_a_token_is_not_sent(token) -> None:
+    assert encode_message(LINKS, token) == encode_message(LINKS)
+
+
+def test_link_cannot_pass_for_a_token() -> None:
+    sneaky = single_instance._TOKEN_MARK + "made-up"
+    links, token = decode_message(encode_message([sneaky, LINKS[0]])[:-1])
+    assert token == ""
+    assert links[-1] == LINKS[0]
+
+
+@pytest.mark.parametrize("token", [TOKEN, None])
+def test_launch_hands_over_its_activation_token(running, make_instance, monkeypatch, token) -> None:
+    """On Wayland the desktop gives the token to the new launch, but the running Weir is
+    the one that has to bring its window forward."""
+    first, received = running
+    tokens: list[str] = []
+    first.activation_requested.connect(lambda _links, given: tokens.append(given))
+    if token is None:
+        monkeypatch.delenv("XDG_ACTIVATION_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("XDG_ACTIVATION_TOKEN", token)
+
+    assert make_instance(first.server_name).start(LINKS) is True
+    assert _deliveries(received) == [LINKS]
+    assert set(tokens) == {token or ""}
+
+
+def test_socket_address_keeps_a_bare_pipe_name_on_windows(monkeypatch) -> None:
+    monkeypatch.setattr(single_instance, "IS_WINDOWS", True)
+    assert socket_address("Weir-0123456789ab") == "Weir-0123456789ab"
+
+
+def test_socket_address_is_one_absolute_path_elsewhere(monkeypatch) -> None:
+    """A bare name goes in the socket folder, the same for the running Weir and every
+    launch; an address passed back in stays as it is."""
+    monkeypatch.setattr(single_instance, "IS_WINDOWS", False)
+    monkeypatch.setattr(single_instance, "_socket_dir", lambda: f"/run/user/{2**32 - 2}")
+    name = single_instance.default_server_name()
+    address = socket_address(name)
+    assert address == f"/run/user/{2**32 - 2}/{name}"
+    assert socket_address(address) == address
+    assert len(os.fsencode(address)) <= 107  # what a Unix socket path can hold
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="named pipes do not live in a folder")
+def test_socket_folder_does_not_follow_tmpdir(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    address = socket_address("Weir-0123456789ab")
+    assert address.startswith("/") and address.endswith("/Weir-0123456789ab")
+    assert not address.startswith(str(tmp_path))
+    monkeypatch.delenv("TMPDIR")
+    assert socket_address("Weir-0123456789ab") == address
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="named pipes do not live in a folder")
+def test_socket_folder_is_the_users_private_runtime_folder(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(single_instance, "_RUNTIME_ROOT", str(tmp_path))
+    mine = tmp_path / str(os.getuid())
+    assert single_instance._socket_dir() == "/tmp"  # no runtime folder (no systemd/elogind)
+
+    mine.mkdir()
+    os.chmod(mine, 0o700)
+    assert single_instance._socket_dir() == str(mine)
+
+    os.chmod(mine, 0o755)  # others could look in
+    assert single_instance._socket_dir() == "/tmp"
+
+    os.chmod(mine, 0o700)
+    mine.rename(tmp_path / "elsewhere")
+    mine.symlink_to(tmp_path / "elsewhere")  # not the folder the system made
+    assert single_instance._socket_dir() == "/tmp"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="named pipes do not live in a folder")
+def test_launch_with_another_tmpdir_still_finds_the_running_weir(make_instance, monkeypatch,
+                                                                tmp_path) -> None:
+    """Qt would put a bare socket name in TMPDIR, and a launch from a terminal can have
+    another one (export TMPDIR=~/tmp in .bashrc): it then waited and started a second Weir."""
+    name = _unique_name()
+    for folder in ("tmp-desktop", "tmp-terminal"):
+        (tmp_path / folder).mkdir()
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp-desktop"))
+    first = make_instance(name)
+    assert first.start() is False
+    received: list[list[str]] = []
+    _record(first, received)
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp-terminal"))
+    began = time.monotonic()
+    assert make_instance(name, wait_ms=4000).start(LINKS) is True
+    assert time.monotonic() - began < 3
+    assert _deliveries(received) == [LINKS]
+
+
+def test_launches_made_from_a_name_or_its_address_share_one_lock(make_instance, monkeypatch,
+                                                                 tmp_path) -> None:
+    """Many tests make the next launch from first.server_name, which off Windows is an
+    absolute socket path: it must still wait on the first launch's lock, in tmp_path,
+    or it takes a lock of its own and starts a second Weir (seen only on Linux CI)."""
+    monkeypatch.setattr(single_instance, "IS_WINDOWS", False)
+    monkeypatch.setattr(single_instance, "_socket_dir", lambda: "/run/user/1000")
+    name = _unique_name()
+    first = make_instance(name)
+    assert first.server_name == f"/run/user/1000/{name}"
+    second = make_instance(first.server_name)
+    # Nothing listens here; this only looks at which lock file each one would take.
+    expected = os.path.normcase(str(tmp_path / f"{name}.lock"))
+    assert first._lock_key == expected
+    assert second._lock_key == expected
 
 
 def test_first_launch_takes_the_lock_and_listens(running) -> None:
@@ -245,7 +385,7 @@ def test_socket_without_a_lock_does_not_hold_up_the_launch(make_instance) -> Non
     """Only the lock holder counts as the running Weir, whatever listens under the name."""
     name = _unique_name()
     stray = QLocalServer()  # accepts connections but never answers
-    assert stray.listen(name)
+    assert stray.listen(socket_address(name))
     instance = make_instance(name, wait_ms=10_000)
     try:
         began = time.monotonic()
@@ -263,7 +403,7 @@ def test_hand_over_notices_when_the_running_weir_hangs_up(make_instance) -> None
     crashed) must not keep the new launch waiting for the rest of the attempt."""
     name = _unique_name()
     server = QLocalServer()
-    assert server.listen(name)
+    assert server.listen(socket_address(name))
 
     def hang_up() -> None:
         while server.hasPendingConnections():
@@ -311,7 +451,7 @@ def test_stuck_weir_does_not_block_a_new_launch_forever(make_instance, tmp_path,
     assert held.tryLock(0)
     silent = QLocalServer()
     if answers == "silent":
-        assert silent.listen(name)
+        assert silent.listen(socket_address(name))
     instance = make_instance(name, wait_ms=1000, lock_path=lock_path)
     try:
         began = time.monotonic()
@@ -326,10 +466,27 @@ def test_stuck_weir_does_not_block_a_new_launch_forever(make_instance, tmp_path,
         held.unlock()
 
 
+def test_weir_that_started_alone_and_quits_does_not_take_over(make_instance, tmp_path,
+                                                             monkeypatch) -> None:
+    """It would answer launches with a window that is closing."""
+    monkeypatch.setattr(single_instance, "_RECLAIM_MS", 50)
+    lock_path = tmp_path / "held.lock"
+    held = QLockFile(str(lock_path))
+    assert held.tryLock(0)
+    instance = make_instance(_unique_name(), wait_ms=300, lock_path=lock_path)
+    assert instance.start() is False
+    instance.stop_listening()  # starts quitting
+
+    held.unlock()  # the stuck Weir is gone
+    _spin(400)
+    assert not instance.holds_lock
+    assert not instance.is_listening
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="named pipes vanish with their process")
 def test_name_left_behind_by_a_crash_is_taken_over(make_instance) -> None:
     name = _unique_name()
-    path = os.path.join(QDir.tempPath(), name)
+    path = socket_address(name)
     leftover = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     leftover.bind(path)
     leftover.close()  # like a crash: the socket file stays, nobody listens
@@ -339,7 +496,7 @@ def test_name_left_behind_by_a_crash_is_taken_over(make_instance) -> None:
     assert first.start() is False
     assert first.is_listening
     received: list[list[str]] = []
-    first.activation_requested.connect(received.append)
+    _record(first, received)
 
     assert make_instance(name).start(LINKS) is True
     assert _deliveries(received) == [LINKS]
@@ -430,7 +587,7 @@ def test_incomplete_message_is_ignored(running, make_instance) -> None:
 def test_connection_python_lost_track_of_is_still_answered(running) -> None:
     first, received = running
     client = _connect_client(first)
-    message = encode_links(LINKS)
+    message = encode_message(LINKS)
     client.write(message[:10])  # the running Weir sees the start of the message
     _spin(150)
     _forget_python_side_of_connections(first)
@@ -504,6 +661,48 @@ def test_handed_over_links_restore_the_window(qapp) -> None:
     assert window.url_edit.links() == [LINKS[0]]
     assert window.isVisible()
     assert not window.isMinimized()
+    window.close()
+
+
+def _watch_activation(window) -> list[str | None]:
+    """The XDG_ACTIVATION_TOKEN that Qt would find each time the window is activated."""
+    seen: list[str | None] = []
+    window.activateWindow = lambda: seen.append(os.environ.get("XDG_ACTIVATION_TOKEN"))
+    return seen
+
+
+def test_handed_over_token_is_there_when_the_window_is_activated(qapp, monkeypatch) -> None:
+    """Qt on Wayland takes the token from the environment as it activates the window."""
+    import main
+
+    monkeypatch.delenv("XDG_ACTIVATION_TOKEN", raising=False)
+    window = _fake_window()
+    seen = _watch_activation(window)
+    main._show_handed_over_links(window, [LINKS[0]], TOKEN)  # type: ignore[arg-type]
+    assert seen == [TOKEN]
+    assert "XDG_ACTIVATION_TOKEN" not in os.environ  # not passed on to programs Weir starts
+
+    main._show_handed_over_links(window, [LINKS[1]], "")  # type: ignore[arg-type]
+    assert seen == [TOKEN, None]
+    assert window.url_edit.links() == LINKS[:2]
+    window.close()
+
+
+def test_running_weir_activates_its_window_with_the_new_launchs_token(
+        running, make_instance, monkeypatch) -> None:
+    import main
+
+    first, _received = running
+    window = _fake_window()
+    seen = _watch_activation(window)
+    main._answer_new_launches(first, window)  # type: ignore[arg-type]
+    monkeypatch.delenv("XDG_ACTIVATION_TOKEN", raising=False)
+    # Only the new launch has the token (both ends share this test's environment).
+    monkeypatch.setattr(single_instance, "launch_activation_token", lambda: TOKEN)
+
+    assert make_instance(first.server_name).start(LINKS[:1]) is True
+    assert seen and set(seen) == {TOKEN}
+    assert window.url_edit.links() == LINKS[:1]
     window.close()
 
 
@@ -706,6 +905,37 @@ def test_weir_that_runs_for_a_long_time_keeps_its_lock(launch, make_instance, tm
     assert _deliveries(child.wait_for("received")) == [LINKS]
 
 
+@pytest.mark.parametrize("then", ["exits", "crashes"])
+def test_weir_that_started_beside_a_stuck_one_takes_over_once_it_is_gone(
+        launch, make_instance, tmp_path, then) -> None:
+    """A launch gives up waiting for a stuck Weir and runs without the lock. Once the stuck
+    one is gone it must take the lock and answer launches: before, the next launch took
+    the freed lock and ran as a second Weir beside it, and so did every launch after."""
+    name, lock = _unique_name(), tmp_path / "weir.lock"
+    (tmp_path / "go").touch()
+    child = launch("stuck", name, lock)
+    assert child.wait_for("result") == "primary"
+    (tmp_path / "hang").touch()
+    child.wait_for("hung")  # holds the lock, answers nothing
+
+    alone = make_instance(name, wait_ms=1000, lock_path=lock)
+    assert alone.start(LINKS) is False
+    assert not alone.holds_lock
+    assert not alone.is_listening
+    received: list[list[str]] = []
+    _record(alone, received)
+
+    if then == "crashes":
+        child.crash()
+    else:
+        (tmp_path / "exit").touch()
+        child.finish()
+    assert _spin_until(lambda: alone.holds_lock and alone.is_listening, ms=15_000)
+
+    assert make_instance(name, lock_path=lock).start(LINKS[:1]) is True
+    assert _deliveries(received) == [LINKS[:1]]
+
+
 def test_launch_that_is_never_told_to_start_still_exits(launch, tmp_path) -> None:
     """Harness: when a test fails before "go", its launches must not hold up teardown."""
     child = launch("idle", _unique_name(), tmp_path / "weir.lock")
@@ -756,7 +986,7 @@ def _child(directory: Path, tag: str, name: str, lock: str, wait_ms: int, links:
         mark("result", "handed")
         return
     received: list[list[str]] = []
-    instance.activation_requested.connect(received.append)
+    _record(instance, received)
     if instance.holds_lock and instance.is_listening:
         mark("result", "primary")
     else:  # runs without the guard: gave up waiting, or could not listen
@@ -768,6 +998,15 @@ def _child(directory: Path, tag: str, name: str, lock: str, wait_ms: int, links:
     def poll() -> None:
         if (directory / "crash").exists():
             os._exit(1)  # like a crash: no clean-up, so the lock file stays behind
+        hang = directory / "hang"
+        if hang.exists():
+            hang.unlink()
+            mark("hung")
+            # Stuck: keeps the lock and answers nothing until told to crash or exit.
+            while not (directory / "exit").exists():
+                if (directory / "crash").exists():
+                    os._exit(1)
+                time.sleep(0.02)
         for then in ("quit", "crash"):
             stall = directory / f"stall-then-{then}"
             if stall.exists():

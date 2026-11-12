@@ -5,6 +5,7 @@ Run from source:  python main.py [links...]
 
 from __future__ import annotations
 
+import os
 import sys
 import traceback
 
@@ -64,7 +65,8 @@ def _install_excepthook() -> None:
     sys.excepthook = hook
 
 
-def _show_handed_over_links(window: MainWindow, links: list[str]) -> None:
+def _show_handed_over_links(window: MainWindow, links: list[str],
+                            activation_token: str = "") -> None:
     """Weir was started again: take the new launch's links and bring the window forward."""
     found = extract_links_from_text("\n".join(links))
     if found:
@@ -74,13 +76,22 @@ def _show_handed_over_links(window: MainWindow, links: list[str]) -> None:
     else:
         window.showNormal()
     window.raise_()
-    window.activateWindow()
+    if activation_token:
+        # Wayland brings a window forward only with the token the desktop gave the launch
+        # the user just started. Qt reads it from here (and clears it) as it activates.
+        os.environ["XDG_ACTIVATION_TOKEN"] = activation_token
+    try:
+        window.activateWindow()
+    finally:
+        if activation_token:
+            # Good for this one activation only: keep it out of programs Weir starts.
+            os.environ.pop("XDG_ACTIVATION_TOKEN", None)
 
 
 def _answer_new_launches(instance: SingleInstance, window: MainWindow) -> None:
     """Pass later launches on to the window, until it starts quitting."""
     instance.activation_requested.connect(
-        lambda received: _show_handed_over_links(window, received)
+        lambda received, token: _show_handed_over_links(window, received, token)
     )
     # Links handed to a window that is closing would be lost: from then on a new launch
     # waits for this Weir to exit and then starts fresh.
