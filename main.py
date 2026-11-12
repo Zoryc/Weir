@@ -20,6 +20,7 @@ from core.settings import Settings
 from ui.icon import app_icon
 from ui.main_window import MainWindow
 from ui.theme import ThemeManager
+from ui.variants import get_variant
 from ui.widgets import extract_links_from_text
 
 
@@ -70,14 +71,14 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setWindowIcon(app_icon())
-    theme = ThemeManager(app)  # Fusion + our light/dark palette, follows the system
     _install_excepthook()
 
     settings = Settings.load()
+    # Fusion + the chosen UI variant's palette and stylesheet; follows system light/dark.
+    theme = ThemeManager(app, get_variant(settings.ui_variant))
     presets = PresetStore.load()
     deps = DepsManager()
-    window = MainWindow(settings, presets, deps)
-    theme.changed.connect(window.refresh_theme)
+    window = MainWindow(settings, presets, deps, theme)
     links = extract_links_from_text(" ".join(sys.argv[1:]))
     if links:
         window.url_edit.add_links(links)

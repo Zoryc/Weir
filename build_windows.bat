@@ -29,6 +29,7 @@ echo Running PyInstaller...
     --name "%APPNAME%" ^
     --icon build\icon.png ^
     --add-data "presets.json;." ^
+    --collect-submodules ui.variants ^
     main.py || goto :error
 
 rem An editable copy of the presets next to the .exe, and an empty tools folder.

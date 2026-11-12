@@ -26,6 +26,7 @@ echo "Running PyInstaller..."
 "$VPY" -m PyInstaller --noconfirm --clean --windowed \
     --name "$APPNAME" \
     --add-data "presets.json:." \
+    --collect-submodules ui.variants \
     main.py
 
 DIST="dist/$APPNAME"

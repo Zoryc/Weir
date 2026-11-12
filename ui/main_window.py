@@ -1,10 +1,16 @@
-"""The single main window: new-download card on top, downloads card below."""
+"""The single main window.
+
+Its controls ("parts") are created once and keep their behaviour; the active UI
+variant (ui/variants/) decides how they are arranged and styled, and can be
+switched live from Settings → Appearance.
+"""
 
 from __future__ import annotations
 
 import os
 import re
 import shutil
+import sys
 from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -12,6 +18,7 @@ from urllib.parse import urlsplit
 from PySide6.QtCore import QByteArray, QDir, QPoint, QProcess, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QAction,
+    QActionGroup,
     QBrush,
     QCloseEvent,
     QColor,
@@ -19,21 +26,20 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDragLeaveEvent,
     QDropEvent,
+    QFont,
     QFontDatabase,
     QGuiApplication,
     QKeySequence,
-    QRegularExpressionValidator,
     QShortcut,
 )
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
-    QHBoxLayout,
     QHeaderView,
     QInputDialog,
     QLabel,
@@ -48,7 +54,6 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
     QToolButton,
     QTreeWidgetItem,
-    QVBoxLayout,
     QWidget,
 )
 
@@ -58,17 +63,20 @@ from core.downloader import DownloadJob, DownloadManager, DownloadOptions, JobSt
 from core.errors import ACTION_COOKIES, ACTION_DENO, ACTION_FFMPEG, ACTION_PRESET, ACTION_UPDATE
 from core.paths import IS_LINUX, IS_WINDOWS, config_dir, default_download_dir, writable_bin_dir
 from core.presets import Preset, PresetStore, split_args
-from core.settings import COOKIE_BROWSERS, DEFAULT_TEMPLATE, Settings
+from core.settings import DEFAULT_TEMPLATE, Settings
 
 from . import theme
 from .dialogs import DepsDialog, ErrorDetailsDialog, UpdateDialog, show_about
 from .icon import app_icon, glyph_icon
+from .kit import set_stretch
+from .theme import ThemeManager, Variant
+from .variants import available_variants
 from .widgets import (
     ACCENT_ROLE,
     PROGRESS_ROLE,
     SUBTITLE_COLOR_ROLE,
     SUBTITLE_ROLE,
-    Card,
+    AdvancedPanel,
     ErrorBanner,
     ProgressDelegate,
     QueueView,
@@ -77,11 +85,16 @@ from .widgets import (
     TitleDelegate,
     UrlEdit,
     extract_links,
+    repolish,
 )
 
 COL_TITLE, COL_PRESET, COL_PROGRESS, COL_SPEED, COL_ETA, COL_STATUS = range(6)
 JOB_ID_ROLE = Qt.ItemDataRole.UserRole + 1
 RATE_RE = re.compile(r"^\d+(\.\d+)?[KMGkmg]?$")
+DEFAULT_LOGO_SIZE = 34
+DEFAULT_COLUMN_WIDTHS: dict[int, int] = {
+    COL_PRESET: 175, COL_PROGRESS: 150, COL_SPEED: 92, COL_ETA: 64, COL_STATUS: 136,
+}
 
 ACTION_LABELS: dict[str, str] = {
     ACTION_COOKIES: "Use browser cookies",
@@ -91,17 +104,21 @@ ACTION_LABELS: dict[str, str] = {
     ACTION_UPDATE: "Update yt-dlp",
 }
 
-
-def _field_label(text: str, parent: QWidget) -> QLabel:
-    label = QLabel(text, parent)
-    label.setObjectName("fieldLabel")
-    return label
-
-
-def _muted_label(text: str, parent: QWidget) -> QLabel:
-    label = QLabel(text, parent)
-    label.setObjectName("muted")
-    return label
+# Parts every variant layout must place (attribute names on MainWindow).
+REQUIRED_PARTS: tuple[str, ...] = (
+    "title_label", "settings_button",
+    "url_edit", "paste_btn", "clear_links_btn",
+    "preset_combo",
+    "folder_edit", "browse_btn", "open_folder_btn",
+    "playlist_check", "subs_check", "meta_check",
+    "advanced_toggle", "advanced_panel",
+    "download_btn", "cancel_btn",
+    "summary_label", "clear_finished_btn", "queue", "banner",
+    "log_toggle", "log_view", "copy_log_btn", "clear_log_btn",
+)
+# Parts a variant may leave out (they are then hidden).
+OPTIONAL_PARTS: tuple[str, ...] = ("logo_label", "tagline_label", "preset_hint")
+PART_NAMES: tuple[str, ...] = REQUIRED_PARTS + OPTIONAL_PARTS
 
 
 def _short_url(url: str) -> str:
@@ -114,11 +131,13 @@ def _short_url(url: str) -> str:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, settings: Settings, presets: PresetStore, deps: DepsManager) -> None:
+    def __init__(self, settings: Settings, presets: PresetStore, deps: DepsManager,
+                 theme_manager: ThemeManager) -> None:
         super().__init__()
         self.settings = settings
         self.presets = presets
         self.deps = deps
+        self.theme_manager = theme_manager
         self.manager = DownloadManager(deps, self)
         self._items: dict[int, QTreeWidgetItem] = {}
         self._deps_dialog: DepsDialog | None = None
@@ -137,10 +156,31 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(760, 560)
         self.setAcceptDrops(True)
 
-        self._build_ui()
+        # Parts live here while no layout holds them (and when a variant omits one).
+        self._parking = QWidget(self)
+        self._parking.hide()
+        self._create_parts()
+        # The page scrolls only when the window is too small for everything
+        # (e.g. Advanced open on a small laptop screen); otherwise it just fits.
+        self._page = QScrollArea(self)
+        self._page.setObjectName("page")
+        self._page.setWidgetResizable(True)
+        self._page.setFrameShape(QFrame.Shape.NoFrame)
+        self._page.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setCentralWidget(self._page)
+
+        self.deps_button = QPushButton(self)
+        self.deps_button.setObjectName("flat")
+        self.deps_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.statusBar().addPermanentWidget(self.deps_button)
+        self.statusBar().setSizeGripEnabled(False)
+
         self.tray = self._build_tray()
+        self.apply_variant(theme_manager.variant)
         self._load_settings_into_ui()
         self._connect_signals()
+        theme_manager.changed.connect(self.refresh_theme)
+        theme_manager.variant_changed.connect(self.apply_variant)
         self._restore_geometry()
         self.refresh_theme()
         self._update_deps_button()
@@ -149,271 +189,100 @@ class MainWindow(QMainWindow):
         self._loading = False
         self.url_edit.setFocus()
 
-    # ------------------------------------------------------------------ UI
+    # --------------------------------------------------------------- parts
 
-    def _build_ui(self) -> None:
-        # The page scrolls only when the window is too small for everything
-        # (e.g. Advanced open on a small laptop screen); otherwise it just fits.
-        page = QScrollArea(self)
-        page.setObjectName("page")
-        page.setWidgetResizable(True)
-        page.setFrameShape(QFrame.Shape.NoFrame)
-        page.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        central = QWidget(page)
-        central.setObjectName("pageContent")
-        page.setWidget(central)
-        self.setCentralWidget(page)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(20, 16, 20, 6)
-        root.setSpacing(14)
+    def _create_parts(self) -> None:
+        """Create every control once. Layouts (variants) only arrange and style them."""
+        p = self._parking
 
-        root.addLayout(self._build_header(central))
-        root.addWidget(self._build_new_download_card(central))
-        root.addWidget(self._build_downloads_card(central), 1)
-        self._align_field_labels()
-
-        self.deps_button = QPushButton(self)
-        self.deps_button.setObjectName("flat")
-        self.deps_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.statusBar().addPermanentWidget(self.deps_button)
-        self.statusBar().setSizeGripEnabled(False)
-
-    def _build_header(self, parent: QWidget) -> QHBoxLayout:
-        header = QHBoxLayout()
-        header.setSpacing(12)
-        logo = QLabel(parent)
-        logo.setPixmap(app_icon().pixmap(34, 34))
-        title = QLabel(APP_DISPLAY_NAME, parent)
-        title.setObjectName("appTitle")
-        tagline = _muted_label("Paste a link · pick a preset · click Download", parent)
-        text = QVBoxLayout()
-        text.setSpacing(0)
-        text.addWidget(title)
-        text.addWidget(tagline)
-        header.addWidget(logo)
-        header.addLayout(text)
-        header.addStretch(1)
-
-        self.settings_button = QToolButton(parent)
+        # Identity + settings
+        self.logo_label = QLabel(p)
+        self.logo_label.setObjectName("appLogo")
+        self.title_label = QLabel(APP_DISPLAY_NAME, p)
+        self.title_label.setObjectName("appTitle")
+        self.tagline_label = QLabel("Paste a link · pick a preset · click Download", p)
+        self.tagline_label.setObjectName("appTagline")
+        self.settings_button = QToolButton(p)
         self.settings_button.setObjectName("menuButton")
         self.settings_button.setText("Settings")
         self.settings_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.settings_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        menu = QMenu(self.settings_button)
-        self._add_action(menu, "Update yt-dlp…", self._update_ytdlp)
-        self._add_action(menu, "Tools (yt-dlp, ffmpeg, Deno)…", self._show_deps_dialog)
-        menu.addSeparator()
-        self._add_action(menu, "Open settings folder", lambda: self._open_path(config_dir()))
-        self._add_action(menu, "Open tools folder", lambda: self._open_path(writable_bin_dir()))
-        menu.addSeparator()
-        self._add_action(menu, f"About {APP_DISPLAY_NAME}", lambda: show_about(self, self.deps))
-        self._add_action(menu, "Quit", self.close)
-        self.settings_button.setMenu(menu)
-        header.addWidget(self.settings_button, 0, Qt.AlignmentFlag.AlignVCenter)
-        return header
+        self.settings_button.setMenu(self._build_settings_menu())
 
-    def _build_new_download_card(self, parent: QWidget) -> Card:
-        card = Card(parent)
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(12)
-
-        top = QHBoxLayout()
-        title = QLabel("New download", card)
-        title.setObjectName("cardTitle")
-        top.addWidget(title)
-        top.addStretch(1)
-        self.clear_links_btn = QPushButton("Clear", card)
+        # Links
+        self.url_edit = UrlEdit(p)
+        self.paste_btn = QPushButton("Paste", p)
+        self.paste_btn.setToolTip("Paste links from the clipboard")
+        self.clear_links_btn = QPushButton("Clear", p)
         self.clear_links_btn.setObjectName("flat")
         self.clear_links_btn.setToolTip("Empty the link box")
-        self.paste_btn = QPushButton("Paste", card)
-        self.paste_btn.setToolTip("Paste links from the clipboard")
-        top.addWidget(self.clear_links_btn)
-        top.addWidget(self.paste_btn)
-        layout.addLayout(top)
 
-        self.url_edit = UrlEdit(card)
-        self.url_edit.setMinimumHeight(84)
-        self.url_edit.setMaximumHeight(130)
-        layout.addWidget(self.url_edit)
-
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(8)
-        grid.setColumnStretch(1, 1)
-        self._main_grid = grid
-
-        self.preset_combo = QComboBox(card)
+        # Preset
+        self.preset_combo = QComboBox(p)
         self.preset_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
-        self.preset_combo.setMinimumContentsLength(30)
+        self.preset_combo.setMinimumContentsLength(28)
         self.preset_combo.setIconSize(QSize(16, 16))
         self.preset_combo.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.preset_hint = _muted_label("", card)
+        self.preset_hint = QLabel(p)
+        self.preset_hint.setObjectName("muted")
         self.preset_hint.setWordWrap(True)
-        preset_box = QVBoxLayout()
-        preset_box.setSpacing(4)
-        preset_box.addWidget(self.preset_combo)
-        preset_box.addWidget(self.preset_hint)
-        grid.addWidget(_field_label("Preset", card), 0, 0, Qt.AlignmentFlag.AlignTop)
-        grid.addLayout(preset_box, 0, 1)
-        grid.itemAtPosition(0, 0).widget().setContentsMargins(0, 8, 0, 0)
 
-        folder_row = QHBoxLayout()
-        folder_row.setSpacing(8)
-        self.folder_edit = QLineEdit(card)
+        # Folder
+        self.folder_edit = QLineEdit(p)
         self.folder_edit.setToolTip("Downloaded files are saved here")
-        self.folder_action = self.folder_edit.addAction(
-            glyph_icon("folder", theme.current().color("muted")),
-            QLineEdit.ActionPosition.LeadingPosition,
-        )
+        # Owned by the window (not the field): layouts get rebuilt, and an action created by
+        # QLineEdit.addAction(icon, …) loses its Python wrapper when the old layout is deleted.
+        self.folder_action = QAction(glyph_icon("folder", theme.current().color("muted")), "", self)
         self.folder_action.setToolTip("Choose a folder")
-        self.browse_btn = QPushButton("Browse…", card)
-        self.open_folder_btn = QPushButton("Open", card)
+        self.folder_edit.addAction(self.folder_action, QLineEdit.ActionPosition.LeadingPosition)
+        self.browse_btn = QPushButton("Browse…", p)
+        self.open_folder_btn = QPushButton("Open", p)
         self.open_folder_btn.setToolTip("Show this folder")
-        folder_row.addWidget(self.folder_edit, 1)
-        folder_row.addWidget(self.browse_btn)
-        folder_row.addWidget(self.open_folder_btn)
-        grid.addWidget(_field_label("Save to", card), 1, 0)
-        grid.addLayout(folder_row, 1, 1)
 
-        checks = QHBoxLayout()
-        checks.setSpacing(22)
-        self.playlist_check = QCheckBox("Download whole playlist", card)
+        # Options
+        self.playlist_check = QCheckBox("Download whole playlist", p)
         self.playlist_check.setToolTip(
             "When a link points into a playlist: on = every video, off = only that video."
         )
-        self.subs_check = QCheckBox("Embed subtitles", card)
+        self.subs_check = QCheckBox("Embed subtitles", p)
         self.subs_check.setToolTip("Adds English and French subtitles to the video file when available.")
-        self.meta_check = QCheckBox("Embed thumbnail && metadata", card)
+        self.meta_check = QCheckBox("Embed thumbnail && metadata", p)
         self.meta_check.setToolTip("Adds cover art, title, artist and date to the file.")
         for check in (self.playlist_check, self.subs_check, self.meta_check):
             check.setCursor(Qt.CursorShape.PointingHandCursor)
-            checks.addWidget(check)
-        checks.addStretch(1)
-        grid.addWidget(_field_label("Options", card), 2, 0)
-        grid.addLayout(checks, 2, 1)
-        layout.addLayout(grid)
 
-        self.advanced_panel = self._build_advanced(card)
-        layout.addWidget(self.advanced_panel)
-
-        divider = QFrame(card)
-        divider.setObjectName("divider")
-        layout.addWidget(divider)
-
-        footer = QHBoxLayout()
-        footer.setSpacing(10)
-        self.advanced_toggle = SectionToggle("Advanced options", self.advanced_panel, card)
+        # Advanced
+        self.advanced_panel = AdvancedPanel(p)
+        self.extra_args_edit = self.advanced_panel.extra_args_edit
+        self.template_edit = self.advanced_panel.template_edit
+        self.template_reset_btn = self.advanced_panel.template_reset_btn
+        self.cookies_combo = self.advanced_panel.cookies_combo
+        self.rate_edit = self.advanced_panel.rate_edit
+        self.parallel_combo = self.advanced_panel.parallel_combo
+        self.save_preset_btn = self.advanced_panel.save_preset_btn
+        self.delete_preset_btn = self.advanced_panel.delete_preset_btn
+        self.advanced_toggle = SectionToggle("Advanced options", self.advanced_panel, p)
         self.advanced_toggle.setToolTip("Cookies, file names, speed limit, your own presets…")
-        footer.addWidget(self.advanced_toggle)
-        footer.addStretch(1)
-        self.cancel_btn = QPushButton("Cancel all", card)
-        self.cancel_btn.setObjectName("secondary")
-        self.cancel_btn.setToolTip("Stop every running and waiting download")
-        self.download_btn = QPushButton("Download", card)
+
+        # Actions
+        self.download_btn = QPushButton("Download", p)
         self.download_btn.setObjectName("primary")
         self.download_btn.setIconSize(QSize(18, 18))
-        self.download_btn.setMinimumWidth(190)
         self.download_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        footer.addWidget(self.cancel_btn)
-        footer.addWidget(self.download_btn)
-        layout.addLayout(footer)
-        return card
+        self.cancel_btn = QPushButton("Cancel all", p)
+        self.cancel_btn.setObjectName("secondary")
+        self.cancel_btn.setToolTip("Stop every running and waiting download")
 
-    def _build_advanced(self, parent: QWidget) -> QWidget:
-        panel = QWidget(parent)
-        grid = QGridLayout(panel)
-        grid.setContentsMargins(0, 6, 0, 2)
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(8)
-        grid.setColumnStretch(1, 1)
-        self._advanced_grid = grid
-
-        self.extra_args_edit = QLineEdit(panel)
-        self.extra_args_edit.setPlaceholderText("Extra yt-dlp options, e.g. --sponsorblock-remove all")
-        grid.addWidget(_field_label("Extra options", panel), 0, 0)
-        grid.addWidget(self.extra_args_edit, 0, 1)
-
-        template_row = QHBoxLayout()
-        self.template_edit = QLineEdit(panel)
-        self.template_edit.setPlaceholderText(DEFAULT_TEMPLATE)
-        self.template_edit.setToolTip(
-            "yt-dlp output template, e.g. %(uploader)s/%(title)s.%(ext)s puts each channel "
-            "in its own folder."
-        )
-        self.template_reset_btn = QPushButton("Reset", panel)
-        self.template_reset_btn.setObjectName("flat")
-        template_row.addWidget(self.template_edit, 1)
-        template_row.addWidget(self.template_reset_btn)
-        grid.addWidget(_field_label("File name", panel), 1, 0)
-        grid.addLayout(template_row, 1, 1)
-
-        cookies_row = QHBoxLayout()
-        cookies_row.setSpacing(12)
-        self.cookies_combo = QComboBox(panel)
-        for key, label in COOKIE_BROWSERS:
-            self.cookies_combo.addItem(label, key)
-        self.cookies_combo.setMinimumWidth(140)
-        cookies_row.addWidget(self.cookies_combo)
-        cookies_row.addWidget(
-            _muted_label("For sites that ask you to sign in. Firefox works best.", panel), 1
-        )
-        grid.addWidget(_field_label("Cookies from", panel), 2, 0)
-        grid.addLayout(cookies_row, 2, 1)
-
-        limits_row = QHBoxLayout()
-        limits_row.setSpacing(12)
-        self.rate_edit = QLineEdit(panel)
-        self.rate_edit.setPlaceholderText("No limit (e.g. 5M)")
-        self.rate_edit.setValidator(QRegularExpressionValidator(r"^\d*(\.\d*)?[KMGkmg]?$", self.rate_edit))
-        self.rate_edit.setFixedWidth(150)
-        self.rate_edit.setToolTip("Maximum download speed per download, e.g. 500K or 5M (bytes/second).")
-        self.parallel_combo = QComboBox(panel)
-        for count in (1, 2, 3):
-            self.parallel_combo.addItem(str(count), count)
-        self.parallel_combo.setToolTip("How many links download at the same time.")
-        limits_row.addWidget(self.rate_edit)
-        limits_row.addSpacing(10)
-        limits_row.addWidget(_field_label("Parallel downloads", panel))
-        limits_row.addWidget(self.parallel_combo)
-        limits_row.addStretch(1)
-        grid.addWidget(_field_label("Speed limit", panel), 3, 0)
-        grid.addLayout(limits_row, 3, 1)
-
-        preset_row = QHBoxLayout()
-        self.save_preset_btn = QPushButton("Save current settings as a new preset…", panel)
-        self.delete_preset_btn = QPushButton("Delete this preset", panel)
-        self.delete_preset_btn.setObjectName("flat")
-        preset_row.addWidget(self.save_preset_btn)
-        preset_row.addWidget(self.delete_preset_btn)
-        preset_row.addStretch(1)
-        grid.addLayout(preset_row, 4, 1)
-        return panel
-
-    def _build_downloads_card(self, parent: QWidget) -> Card:
-        card = Card(parent)
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(20, 14, 20, 12)
-        layout.setSpacing(10)
-
-        top = QHBoxLayout()
-        title = QLabel("Downloads", card)
-        title.setObjectName("cardTitle")
-        self.summary_label = _muted_label("", card)
-        self.clear_finished_btn = QPushButton("Clear finished", card)
+        # Downloads
+        self.summary_label = QLabel(p)
+        self.summary_label.setObjectName("muted")
+        self.clear_finished_btn = QPushButton("Clear finished", p)
         self.clear_finished_btn.setObjectName("flat")
         self.clear_finished_btn.setToolTip("Remove finished, failed and cancelled downloads from the list")
-        top.addWidget(title)
-        top.addSpacing(10)
-        top.addWidget(self.summary_label)
-        top.addStretch(1)
-        top.addWidget(self.clear_finished_btn)
-        layout.addLayout(top)
-
-        self.queue = QueueView(card)
+        self.queue = QueueView(p)
         self.queue.setColumnCount(6)
         self.queue.setHeaderLabels(["Title", "Preset", "Progress", "Speed", "ETA", "Status"])
         self.queue.setRootIsDecorated(False)
@@ -431,52 +300,133 @@ class MainWindow(QMainWindow):
         header.setStretchLastSection(False)
         header.setHighlightSections(False)
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        header.setSectionResizeMode(COL_TITLE, QHeaderView.ResizeMode.Stretch)
-        for column, width in ((COL_PRESET, 175), (COL_PROGRESS, 150), (COL_SPEED, 92),
-                              (COL_ETA, 64), (COL_STATUS, 136)):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
-            self.queue.setColumnWidth(column, width)
-        layout.addWidget(self.queue, 3)
+        self.banner = ErrorBanner(p)
 
-        self.banner = ErrorBanner(card)
-        layout.addWidget(self.banner)
-
-        self.log_view = QPlainTextEdit(card)
+        # Log
+        self.log_view = QPlainTextEdit(p)
         self.log_view.setObjectName("log")
         self.log_view.setReadOnly(True)
         self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.log_view.setMaximumBlockCount(5000)
-        self.log_view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         self.log_view.setMinimumHeight(110)
-
-        log_row = QHBoxLayout()
-        self.log_toggle = SectionToggle("Log", self.log_view, card)
+        self.log_toggle = SectionToggle("Log", self.log_view, p)
         self.log_toggle.setToolTip("Show yt-dlp's own output (useful when asking for help)")
-        self.copy_log_btn = QPushButton("Copy all", card)
+        self.copy_log_btn = QPushButton("Copy all", p)
         self.copy_log_btn.setObjectName("flat")
-        self.clear_log_btn = QPushButton("Clear", card)
+        self.clear_log_btn = QPushButton("Clear", p)
         self.clear_log_btn.setObjectName("flat")
-        log_row.addWidget(self.log_toggle)
-        log_row.addStretch(1)
-        log_row.addWidget(self.copy_log_btn)
-        log_row.addWidget(self.clear_log_btn)
-        layout.addLayout(log_row)
-        layout.addWidget(self.log_view, 2)
-        self._downloads_layout = layout
-        return card
 
-    def _align_field_labels(self) -> None:
-        """Give the left-hand labels of both forms the same width so inputs line up."""
-        labels: list[QLabel] = []
-        for grid in (self._main_grid, self._advanced_grid):
-            for row in range(grid.rowCount()):
-                item = grid.itemAtPosition(row, 0)
-                widget = item.widget() if item is not None else None
-                if isinstance(widget, QLabel):
-                    labels.append(widget)
-        width = max((label.sizeHint().width() for label in labels), default=0)
-        for label in labels:
-            label.setMinimumWidth(width)
+        self.parts: dict[str, QWidget] = {name: getattr(self, name) for name in PART_NAMES}
+        self._part_defaults = {
+            name: (
+                widget.minimumSize(),
+                widget.maximumSize(),
+                QSizePolicy(widget.sizePolicy()),
+                widget.contentsMargins(),
+                QSize(widget.iconSize()) if isinstance(widget, QAbstractButton) else None,
+            )
+            for name, widget in self.parts.items()
+        }
+        self._preset_contents_length = self.preset_combo.minimumContentsLength()
+        self.set_logo_size(DEFAULT_LOGO_SIZE)
+
+    def _build_settings_menu(self) -> QMenu:
+        menu = QMenu(self)
+        self._add_action(menu, "Update yt-dlp…", self._update_ytdlp)
+        self._add_action(menu, "Tools (yt-dlp, ffmpeg, Deno)…", self._show_deps_dialog)
+        appearance = menu.addMenu("Appearance")
+        appearance.setToolTipsVisible(True)
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self._appearance_actions: dict[str, QAction] = {}
+        for variant in available_variants():
+            action = QAction(variant.name, self)
+            action.setCheckable(True)
+            action.setToolTip(variant.description)
+            action.triggered.connect(lambda _checked=False, v=variant: self._choose_variant(v))
+            group.addAction(action)
+            appearance.addAction(action)
+            self._appearance_actions[variant.key] = action
+        menu.addSeparator()
+        self._add_action(menu, "Open settings folder", lambda: self._open_path(config_dir()))
+        self._add_action(menu, "Open tools folder", lambda: self._open_path(writable_bin_dir()))
+        menu.addSeparator()
+        self._add_action(menu, f"About {APP_DISPLAY_NAME}", lambda: show_about(self, self.deps))
+        self._add_action(menu, "Quit", self.close)
+        return menu
+
+    def set_logo_size(self, size: int) -> None:
+        """For variants: size of the app icon shown by ``logo_label``."""
+        self.logo_label.setPixmap(app_icon().pixmap(size, size))
+
+    def _reset_parts(self) -> None:
+        """Undo layout-specific tweaks from the previous variant."""
+        for name, widget in self.parts.items():
+            min_size, max_size, policy, margins, icon_size = self._part_defaults[name]
+            widget.setMinimumSize(min_size)
+            widget.setMaximumSize(max_size)
+            widget.setSizePolicy(policy)
+            widget.setContentsMargins(margins)
+            if icon_size is not None and isinstance(widget, QAbstractButton):
+                widget.setIconSize(icon_size)
+            if widget.property("role") is not None:
+                widget.setProperty("role", None)
+        self.advanced_panel.set_stacked(False)
+        self.preset_combo.setMinimumContentsLength(self._preset_contents_length)
+        self.set_logo_size(DEFAULT_LOGO_SIZE)
+        header = self.queue.header()
+        header.setSectionResizeMode(COL_TITLE, QHeaderView.ResizeMode.Stretch)
+        for column, width in DEFAULT_COLUMN_WIDTHS.items():
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+            self.queue.setColumnWidth(column, width)
+            self.queue.setColumnHidden(column, False)
+
+    def apply_variant(self, variant: Variant) -> None:
+        """Arrange the parts with the variant's layout. Safe to call at any time."""
+        banner_shown = not self.banner.isHidden()
+        content = QWidget()
+        content.setObjectName("pageContent")
+        self._reset_parts()
+        try:
+            variant.build_layout(self, content)
+        except Exception:  # noqa: BLE001 - a broken variant must not take the app down
+            import traceback
+
+            traceback.print_exc()
+            content.deleteLater()
+            fallback = available_variants()[0]
+            if fallback.key != variant.key:
+                self.theme_manager.set_variant(fallback)  # re-enters via variant_changed…
+                if self._page.widget() is None:  # …unless not connected yet (startup)
+                    self.apply_variant(fallback)
+            return
+
+        for name, widget in self.parts.items():
+            if content.isAncestorOf(widget):
+                widget.setVisible(True)
+            else:
+                if name in REQUIRED_PARTS:
+                    print(f"[variant {variant.key}] part not placed: {name}", file=sys.stderr)
+                widget.setParent(self._parking)
+                widget.hide()
+        self.advanced_panel.setVisible(self.advanced_toggle.isChecked())
+        self.log_view.setVisible(self.log_toggle.isChecked())
+        self.banner.setVisible(banner_shown and content.isAncestorOf(self.banner))
+
+        self._page.setWidget(content)  # deletes the previous layout's own widgets
+        for widget in self.parts.values():
+            repolish(widget)
+        self._on_log_toggled(self.log_toggle.isChecked())
+        self.queue.doItemsLayout()
+        action = self._appearance_actions.get(variant.key)
+        if action is not None:
+            action.setChecked(True)
+        self.refresh_theme()
+
+    def _choose_variant(self, variant: Variant) -> None:
+        self.theme_manager.set_variant(variant)  # emits variant_changed -> apply_variant
+        self.settings.ui_variant = variant.key
+        self._schedule_save()
 
     def _add_action(self, menu: QMenu, text: str, slot: object) -> QAction:
         action = QAction(text, self)
@@ -502,9 +452,12 @@ class MainWindow(QMainWindow):
         return tray
 
     def refresh_theme(self) -> None:
-        """Re-create theme-coloured icons and repaint the queue (light/dark switch)."""
+        """Re-create theme-coloured icons and repaint the queue (light/dark or variant switch)."""
         t = theme.current()
-        self.download_btn.setIcon(glyph_icon("download", QColor("#ffffff"), QColor(255, 255, 255, 170)))
+        m = theme.metrics()
+        self.download_btn.setIcon(
+            glyph_icon("download", t.color("on_accent"), theme.tint(t.color("on_accent"), 170))
+        )
         self.paste_btn.setIcon(glyph_icon("paste", t.color("text")))
         self.settings_button.setIcon(glyph_icon("settings", t.color("text")))
         self.folder_action.setIcon(glyph_icon("folder", t.color("muted")))
@@ -512,8 +465,18 @@ class MainWindow(QMainWindow):
         self.log_toggle.refresh_icon()
         self.banner.refresh_theme()
         self._refresh_preset_icons()
+        log_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        if m.mono_families:
+            log_font = QFont(log_font)
+            log_font.setFamilies(list(m.mono_families))
+        log_font.setPointSizeF(max(8.0, m.font_size - 0.5))
+        self.log_view.setFont(log_font)
+        active = theme.variant()
+        if active is not None and active.after_refresh is not None:
+            active.after_refresh(self, t)
         for job in self.manager.jobs():
             self._update_item(job)
+        self.queue.doItemsLayout()
         self.queue.viewport().update()
 
     # ------------------------------------------------------------- signals
@@ -613,6 +576,7 @@ class MainWindow(QMainWindow):
         s.max_parallel = int(self.parallel_combo.currentData() or 2)
         s.show_advanced = self.advanced_toggle.isChecked()
         s.show_log = self.log_toggle.isChecked()
+        s.ui_variant = self.theme_manager.variant.key
         s.window_geometry = bytes(self.saveGeometry().toBase64().data()).decode("ascii")
         s.save()
 
@@ -621,7 +585,7 @@ class MainWindow(QMainWindow):
         self._schedule_save()
 
     def _on_log_toggled(self, expanded: bool) -> None:
-        self._downloads_layout.setStretchFactor(self.log_view, 2 if expanded else 0)
+        set_stretch(self.log_view, 2 if expanded else 0)
         self.copy_log_btn.setVisible(expanded)
         self.clear_log_btn.setVisible(expanded)
         self._schedule_save()

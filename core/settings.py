@@ -35,6 +35,7 @@ class Settings:
     show_log: bool = False
     show_advanced: bool = False
     skip_startup_deps_prompt: bool = False
+    ui_variant: str = "classic"
     window_geometry: str = ""
 
     @staticmethod

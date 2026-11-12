@@ -28,11 +28,15 @@ from PySide6.QtGui import (
     QPainter,
     QPaintEvent,
 )
+from PySide6.QtGui import QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPlainTextEdit,
     QPushButton,
     QStyle,
@@ -40,8 +44,11 @@ from PySide6.QtWidgets import (
     QStyleOptionViewItem,
     QToolButton,
     QTreeWidget,
+    QVBoxLayout,
     QWidget,
 )
+
+from core.settings import COOKIE_BROWSERS, DEFAULT_TEMPLATE
 
 from . import theme
 from .icon import glyph_icon, glyph_pixmap
@@ -208,7 +215,7 @@ def _draw_cell_background(painter: QPainter, option: QStyleOptionViewItem,
 
 def _row_height(option: QStyleOptionViewItem) -> int:
     fm = QFontMetrics(option.font)  # type: ignore[attr-defined]
-    return int(fm.height() * 2 + 22)
+    return int(fm.height() * 2 + theme.metrics().row_extra)
 
 
 class TitleDelegate(QStyledItemDelegate):
@@ -445,3 +452,137 @@ class ErrorBanner(QFrame):
     def _emit_job(self, signal: SignalInstance) -> None:
         if self._job_id is not None:
             signal.emit(self._job_id)
+
+
+class AdvancedPanel(QWidget):
+    """The “Advanced options” controls, arranged side-by-side or stacked.
+
+    Side-by-side (default): label column on the left, fields on the right — use
+    ``labels`` to line them up with other forms. Stacked: each label above its
+    field, for narrow places such as a sidebar (``set_stacked(True)``).
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("advancedPanel")
+        self.extra_args_edit = QLineEdit(self)
+        self.extra_args_edit.setPlaceholderText("Extra yt-dlp options, e.g. --sponsorblock-remove all")
+        self.template_edit = QLineEdit(self)
+        self.template_edit.setPlaceholderText(DEFAULT_TEMPLATE)
+        self.template_edit.setToolTip(
+            "yt-dlp output template, e.g. %(uploader)s/%(title)s.%(ext)s puts each channel "
+            "in its own folder."
+        )
+        self.template_reset_btn = QPushButton("Reset", self)
+        self.template_reset_btn.setObjectName("flat")
+        self.cookies_combo = QComboBox(self)
+        for key, label in COOKIE_BROWSERS:
+            self.cookies_combo.addItem(label, key)
+        self.cookies_combo.setMinimumWidth(130)
+        self.cookies_hint = QLabel("For sites that ask you to sign in. Firefox works best.", self)
+        self.cookies_hint.setObjectName("muted")
+        self.cookies_hint.setWordWrap(True)
+        self.rate_edit = QLineEdit(self)
+        self.rate_edit.setPlaceholderText("No limit (e.g. 5M)")
+        self.rate_edit.setValidator(QRegularExpressionValidator(r"^\d*(\.\d*)?[KMGkmg]?$", self.rate_edit))
+        self.rate_edit.setToolTip("Maximum download speed per download, e.g. 500K or 5M (bytes/second).")
+        self.parallel_combo = QComboBox(self)
+        for count in (1, 2, 3):
+            self.parallel_combo.addItem(str(count), count)
+        self.parallel_combo.setToolTip("How many links download at the same time.")
+        self.save_preset_btn = QPushButton("Save current settings as a new preset…", self)
+        self.delete_preset_btn = QPushButton("Delete this preset", self)
+        self.delete_preset_btn.setObjectName("flat")
+
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 6, 0, 2)
+        self._grid.setHorizontalSpacing(16)
+        self._grid.setVerticalSpacing(8)
+        self._containers: list[QWidget] = []
+        self._labels: list[QLabel] = []
+        self._stacked: bool | None = None
+        self.set_stacked(False)
+
+    @property
+    def labels(self) -> list[QLabel]:
+        """Left-hand labels in side-by-side mode (empty when stacked)."""
+        return [] if self._stacked else list(self._labels)
+
+    @property
+    def stacked(self) -> bool:
+        return bool(self._stacked)
+
+    def _label(self, text: str) -> QLabel:
+        label = QLabel(text, self)
+        label.setObjectName("fieldLabel")
+        self._labels.append(label)
+        return label
+
+    def _row(self, *items: QWidget | int | None | tuple[QWidget, int], vertical: bool = False) -> QWidget:
+        container = QWidget(self)
+        box: QHBoxLayout | QVBoxLayout = QVBoxLayout(container) if vertical else QHBoxLayout(container)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(6 if vertical else 10)
+        for item in items:
+            if item is None:
+                box.addStretch(1)
+            elif isinstance(item, int):
+                box.addSpacing(item)
+            elif isinstance(item, tuple):
+                box.addWidget(item[0], item[1])
+            else:
+                box.addWidget(item)
+        self._containers.append(container)
+        return container
+
+    def set_stacked(self, stacked: bool) -> None:
+        if stacked == self._stacked:
+            return
+        self._stacked = stacked
+        old_containers, old_labels = self._containers, self._labels
+        self._containers, self._labels = [], []
+        while self._grid.count():
+            self._grid.takeAt(0)
+
+        rows: list[tuple[QLabel | None, QWidget]]
+        if stacked:
+            rows = [
+                (self._label("Extra options"), self._row(self.extra_args_edit)),
+                (self._label("File name"), self._row(self.template_edit, self.template_reset_btn)),
+                (self._label("Cookies from"), self._row(self.cookies_combo, self.cookies_hint, vertical=True)),
+                (self._label("Speed limit"), self._row(self.rate_edit)),
+                (self._label("Parallel downloads"), self._row(self.parallel_combo, None)),
+                (None, self._row(self.save_preset_btn, self.delete_preset_btn, vertical=True)),
+            ]
+            for index, (label, field) in enumerate(rows):
+                if label is not None:
+                    self._grid.addWidget(label, index * 2, 0)
+                self._grid.addWidget(field, index * 2 + 1, 0)
+            self._grid.setColumnStretch(0, 1)
+            self._grid.setColumnStretch(1, 0)
+            self._grid.setVerticalSpacing(4)
+        else:
+            parallel_label = QLabel("Parallel downloads", self)
+            parallel_label.setObjectName("fieldLabel")
+            self._containers.append(parallel_label)
+            self.rate_edit.setMaximumWidth(150)
+            rows = [
+                (self._label("Extra options"), self._row(self.extra_args_edit)),
+                (self._label("File name"), self._row(self.template_edit, self.template_reset_btn)),
+                (self._label("Cookies from"), self._row(self.cookies_combo, (self.cookies_hint, 1))),
+                (self._label("Speed limit"),
+                 self._row(self.rate_edit, 10, parallel_label, self.parallel_combo, None)),
+                (None, self._row(self.save_preset_btn, self.delete_preset_btn, None)),
+            ]
+            for index, (label, field) in enumerate(rows):
+                if label is not None:
+                    self._grid.addWidget(label, index, 0)
+                self._grid.addWidget(field, index, 1)
+            self._grid.setColumnStretch(0, 0)
+            self._grid.setColumnStretch(1, 1)
+            self._grid.setVerticalSpacing(8)
+        if stacked:
+            self.rate_edit.setMaximumWidth(16777215)
+        for widget in (*old_containers, *old_labels):
+            widget.hide()
+            widget.deleteLater()
