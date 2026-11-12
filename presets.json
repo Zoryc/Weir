@@ -1,0 +1,35 @@
+{
+  "_comment": "Built-in presets. 'args' are yt-dlp options written like on a command line; 'description' is the hint shown under the dropdown. Presets you save from the app go to presets.json in your settings folder instead.",
+  "presets": [
+    {
+      "name": "Best video – MP4 (plays everywhere)",
+      "description": "Best quality that plays on any phone, TV or computer.",
+      "args": "-t mp4"
+    },
+    {
+      "name": "1080p MP4",
+      "description": "Full HD video, H.264 + AAC. Very compatible.",
+      "args": "-S \"res:1080,vcodec:h264,acodec:aac\" --merge-output-format mp4 --remux-video mp4"
+    },
+    {
+      "name": "720p MP4 (smaller file)",
+      "description": "HD video at roughly half the size of 1080p.",
+      "args": "-S \"res:720,vcodec:h264,acodec:aac\" --merge-output-format mp4 --remux-video mp4"
+    },
+    {
+      "name": "Max quality – MKV (4K/VP9/AV1)",
+      "description": "Highest resolution available (4K and above). Best played on a computer, e.g. with VLC.",
+      "args": "-f \"bv*+ba/b\" -t mkv"
+    },
+    {
+      "name": "Audio – MP3 (best quality)",
+      "description": "Sound only, as an MP3 that plays everywhere.",
+      "args": "-x --audio-format mp3 --audio-quality 0"
+    },
+    {
+      "name": "Audio – original (no re-encode)",
+      "description": "Sound only, in the site's original format (often Opus or M4A). No quality loss.",
+      "args": "-f \"ba/b\" -x"
+    }
+  ]
+}

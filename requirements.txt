@@ -1,0 +1,2 @@
+# Runtime dependency (QtCore, QtGui, QtWidgets, QtNetwork are all in Essentials).
+PySide6-Essentials>=6.7

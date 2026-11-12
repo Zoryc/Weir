@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyInstaller output
+build/
+dist/
+*.spec
+
+# Tools downloaded by the app (yt-dlp, ffmpeg, ffprobe, deno)
+bin/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
