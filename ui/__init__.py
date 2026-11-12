@@ -1,1 +1,1 @@
-"""Qt user interface for Ytdlp Downloader."""
+"""Qt user interface for Weir."""

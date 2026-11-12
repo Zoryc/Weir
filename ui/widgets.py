@@ -44,7 +44,6 @@ from PySide6.QtWidgets import (
     QStyleOptionViewItem,
     QToolButton,
     QTreeWidget,
-    QVBoxLayout,
     QWidget,
 )
 
@@ -455,12 +454,7 @@ class ErrorBanner(QFrame):
 
 
 class AdvancedPanel(QWidget):
-    """The “Advanced options” controls, arranged side-by-side or stacked.
-
-    Side-by-side (default): label column on the left, fields on the right — use
-    ``labels`` to line them up with other forms. Stacked: each label above its
-    field, for narrow places such as a sidebar (``set_stacked(True)``).
-    """
+    """The “Advanced options” controls: labels on the left, fields on the right."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -494,35 +488,35 @@ class AdvancedPanel(QWidget):
         self.delete_preset_btn = QPushButton("Delete this preset", self)
         self.delete_preset_btn.setObjectName("flat")
 
-        self._grid = QGridLayout(self)
-        self._grid.setContentsMargins(0, 6, 0, 2)
-        self._grid.setHorizontalSpacing(16)
-        self._grid.setVerticalSpacing(8)
-        self._containers: list[QWidget] = []
-        self._labels: list[QLabel] = []
-        self._stacked: bool | None = None
-        self.set_stacked(False)
+        self.rate_edit.setMaximumWidth(150)
+        grid = QGridLayout(self)
+        grid.setContentsMargins(0, 6, 0, 2)
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(8)
+        grid.setColumnStretch(1, 1)
+        rows: list[tuple[str, list[QWidget | int | None | tuple[QWidget, int]]]] = [
+            ("Extra options", [self.extra_args_edit]),
+            ("File name", [self.template_edit, self.template_reset_btn]),
+            ("Cookies from", [self.cookies_combo, (self.cookies_hint, 1)]),
+            ("Speed limit", [self.rate_edit, 10, self._field_label("Parallel downloads"),
+                             self.parallel_combo, None]),
+            ("", [self.save_preset_btn, self.delete_preset_btn, None]),
+        ]
+        for index, (label, items) in enumerate(rows):
+            if label:
+                grid.addWidget(self._field_label(label), index, 0)
+            grid.addLayout(self._row(items), index, 1)
 
-    @property
-    def labels(self) -> list[QLabel]:
-        """Left-hand labels in side-by-side mode (empty when stacked)."""
-        return [] if self._stacked else list(self._labels)
-
-    @property
-    def stacked(self) -> bool:
-        return bool(self._stacked)
-
-    def _label(self, text: str) -> QLabel:
+    def _field_label(self, text: str) -> QLabel:
         label = QLabel(text, self)
         label.setObjectName("fieldLabel")
-        self._labels.append(label)
         return label
 
-    def _row(self, *items: QWidget | int | None | tuple[QWidget, int], vertical: bool = False) -> QWidget:
-        container = QWidget(self)
-        box: QHBoxLayout | QVBoxLayout = QVBoxLayout(container) if vertical else QHBoxLayout(container)
+    @staticmethod
+    def _row(items: list[QWidget | int | None | tuple[QWidget, int]]) -> QHBoxLayout:
+        box = QHBoxLayout()
         box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(6 if vertical else 10)
+        box.setSpacing(10)
         for item in items:
             if item is None:
                 box.addStretch(1)
@@ -532,57 +526,4 @@ class AdvancedPanel(QWidget):
                 box.addWidget(item[0], item[1])
             else:
                 box.addWidget(item)
-        self._containers.append(container)
-        return container
-
-    def set_stacked(self, stacked: bool) -> None:
-        if stacked == self._stacked:
-            return
-        self._stacked = stacked
-        old_containers, old_labels = self._containers, self._labels
-        self._containers, self._labels = [], []
-        while self._grid.count():
-            self._grid.takeAt(0)
-
-        rows: list[tuple[QLabel | None, QWidget]]
-        if stacked:
-            rows = [
-                (self._label("Extra options"), self._row(self.extra_args_edit)),
-                (self._label("File name"), self._row(self.template_edit, self.template_reset_btn)),
-                (self._label("Cookies from"), self._row(self.cookies_combo, self.cookies_hint, vertical=True)),
-                (self._label("Speed limit"), self._row(self.rate_edit)),
-                (self._label("Parallel downloads"), self._row(self.parallel_combo, None)),
-                (None, self._row(self.save_preset_btn, self.delete_preset_btn, vertical=True)),
-            ]
-            for index, (label, field) in enumerate(rows):
-                if label is not None:
-                    self._grid.addWidget(label, index * 2, 0)
-                self._grid.addWidget(field, index * 2 + 1, 0)
-            self._grid.setColumnStretch(0, 1)
-            self._grid.setColumnStretch(1, 0)
-            self._grid.setVerticalSpacing(4)
-        else:
-            parallel_label = QLabel("Parallel downloads", self)
-            parallel_label.setObjectName("fieldLabel")
-            self._containers.append(parallel_label)
-            self.rate_edit.setMaximumWidth(150)
-            rows = [
-                (self._label("Extra options"), self._row(self.extra_args_edit)),
-                (self._label("File name"), self._row(self.template_edit, self.template_reset_btn)),
-                (self._label("Cookies from"), self._row(self.cookies_combo, (self.cookies_hint, 1))),
-                (self._label("Speed limit"),
-                 self._row(self.rate_edit, 10, parallel_label, self.parallel_combo, None)),
-                (None, self._row(self.save_preset_btn, self.delete_preset_btn, None)),
-            ]
-            for index, (label, field) in enumerate(rows):
-                if label is not None:
-                    self._grid.addWidget(label, index, 0)
-                self._grid.addWidget(field, index, 1)
-            self._grid.setColumnStretch(0, 0)
-            self._grid.setColumnStretch(1, 1)
-            self._grid.setVerticalSpacing(8)
-        if stacked:
-            self.rate_edit.setMaximumWidth(16777215)
-        for widget in (*old_containers, *old_labels):
-            widget.hide()
-            widget.deleteLater()
+        return box

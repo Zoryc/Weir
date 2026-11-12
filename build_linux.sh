@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
-# Build Ytdlp Downloader for Linux (PyInstaller one-folder build).
+# Build Weir for Linux: a PyInstaller one-folder build packed into an AppImage.
+#   dist/Weir/                          the app folder
+#   dist/Weir-<version>-<arch>.AppImage single file: download, make executable, double-click
 # Usage: ./build_linux.sh [--with-bin]
 #   --with-bin  also copy the local bin/ folder (yt-dlp, ffmpeg, deno) into the build
+# Build on the oldest distribution you want to support (glibc compatibility).
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APPNAME="YtdlpDownloader"
+APPNAME="Weir"
 PY="${PYTHON:-python3}"
+
+case "$(uname -m)" in
+    x86_64 | amd64) ARCH=x86_64 ;;
+    aarch64 | arm64) ARCH=aarch64 ;;
+    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
 
 if [ ! -x .venv/bin/python ]; then
     echo "Creating virtual environment..."
@@ -17,23 +26,21 @@ VPY=".venv/bin/python"
 echo "Installing build requirements..."
 "$VPY" -m pip install --upgrade pip
 "$VPY" -m pip install -r requirements.txt "pyinstaller>=6.6"
+VERSION="$("$VPY" -c 'import core; print(core.APP_VERSION)')"
 
-echo "Drawing the app icon..."
+echo "Drawing the logo..."
 mkdir -p build
-"$VPY" -m ui.icon build/icon.png
+"$VPY" -m ui.icon build/weir.png
 
 echo "Running PyInstaller..."
 "$VPY" -m PyInstaller --noconfirm --clean --windowed \
     --name "$APPNAME" \
     --add-data "presets.json:." \
-    --collect-submodules ui.variants \
     main.py
 
 DIST="dist/$APPNAME"
 cp presets.json "$DIST/presets.json"
 mkdir -p "$DIST/bin"
-cp build/icon.png "$DIST/ytdlp-downloader.png"
-
 if [ "${1:-}" = "--with-bin" ]; then
     if [ -d bin ]; then
         echo "Copying bin/ tools into the build..."
@@ -43,33 +50,49 @@ if [ "${1:-}" = "--with-bin" ]; then
     fi
 fi
 
-# Helper that adds the app to the desktop's application menu (optional).
-cat > "$DIST/install-menu-entry.sh" <<'EOF'
-#!/usr/bin/env bash
-# Adds Ytdlp Downloader to your application menu (for the current user only).
-set -euo pipefail
-HERE="$(cd "$(dirname "$0")" && pwd)"
-APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-mkdir -p "$APPS"
-cat > "$APPS/ytdlp-downloader.desktop" <<DESKTOP
+echo "Assembling the AppImage..."
+# Inside the AppImage the app folder is read-only, so Weir keeps the tools it
+# downloads in ~/.local/share/Weir/bin instead.
+APPDIR="build/$APPNAME.AppDir"
+rm -rf "$APPDIR"
+mkdir -p "$APPDIR/usr/lib" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+cp -a "$DIST" "$APPDIR/usr/lib/weir"
+
+cat > "$APPDIR/AppRun" <<'APPRUN'
+#!/bin/sh
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/lib/weir/Weir" "$@"
+APPRUN
+chmod +x "$APPDIR/AppRun"
+
+cat > "$APPDIR/weir.desktop" <<'DESKTOP'
 [Desktop Entry]
 Type=Application
-Name=Ytdlp Downloader
-Comment=Download videos and music with yt-dlp
-Exec="$HERE/YtdlpDownloader" %U
-Icon=$HERE/ytdlp-downloader.png
+Name=Weir
+GenericName=Video Downloader
+Comment=Download videos and music from a link
+Exec=Weir %U
+Icon=weir
 Terminal=false
 Categories=Network;AudioVideo;
-StartupWMClass=YtdlpDownloader
+Keywords=youtube;video;music;download;yt-dlp;
+StartupWMClass=Weir
 DESKTOP
-update-desktop-database "$APPS" >/dev/null 2>&1 || true
-echo "Added to the application menu: $APPS/ytdlp-downloader.desktop"
-EOF
-chmod +x "$DIST/install-menu-entry.sh" "$DIST/$APPNAME"
+cp "$APPDIR/weir.desktop" "$APPDIR/usr/share/applications/weir.desktop"
+cp build/weir.png "$APPDIR/weir.png"
+cp build/weir.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/weir.png"
+ln -sfn weir.png "$APPDIR/.DirIcon"
 
-ARCH="$(uname -m)"
-tar -C dist -czf "dist/$APPNAME-linux-$ARCH.tar.gz" "$APPNAME"
+TOOL="build/appimagetool-$ARCH.AppImage"
+if [ ! -x "$TOOL" ]; then
+    echo "Downloading appimagetool..."
+    curl -fL -o "$TOOL" \
+        "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$ARCH.AppImage"
+    chmod +x "$TOOL"
+fi
+OUT="dist/$APPNAME-$VERSION-$ARCH.AppImage"
+# --appimage-extract-and-run: works on build machines without FUSE.
+ARCH="$ARCH" "$TOOL" --appimage-extract-and-run "$APPDIR" "$OUT"
 
 echo
-echo "Done: $DIST/$APPNAME"
-echo "Archive: dist/$APPNAME-linux-$ARCH.tar.gz"
+echo "Done: $OUT"

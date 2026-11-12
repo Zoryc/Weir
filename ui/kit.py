@@ -1,20 +1,10 @@
-"""Small helpers for writing variant layouts (see ui/variants/README.md)."""
+"""Small layout helpers used by ui/design.py."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable
 
-from PySide6.QtWidgets import (
-    QBoxLayout,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QLayout,
-    QVBoxLayout,
-    QWidget,
-)
-
-from .widgets import Card, repolish
+from PySide6.QtWidgets import QBoxLayout, QFrame, QHBoxLayout, QLayout, QVBoxLayout, QWidget
 
 # Layout items accepted by hbox()/vbox():
 #   QWidget / QLayout         added as-is
@@ -55,59 +45,12 @@ def vbox(*items: Item, spacing: int = 8, margins: tuple[int, int, int, int] = (0
     return box
 
 
-def card(parent: QWidget, name: str = "card") -> Card:
-    """Rounded panel. Base QSS styles objectName "card"; pass another name for custom QSS."""
-    frame = Card(parent)
-    frame.setObjectName(name)
-    return frame
-
-
 def panel(parent: QWidget, name: str) -> QFrame:
-    """Plain frame with an objectName, for custom-styled areas (sidebar, hero, app bar…)."""
+    """Plain frame with an objectName, styled by the design's stylesheet."""
     frame = QFrame(parent)
     frame.setObjectName(name)
     frame.setFrameShape(QFrame.Shape.NoFrame)
     return frame
-
-
-def title(text: str, parent: QWidget, name: str = "cardTitle") -> QLabel:
-    label = QLabel(text, parent)
-    label.setObjectName(name)
-    return label
-
-
-def field_label(text: str, parent: QWidget) -> QLabel:
-    label = QLabel(text, parent)
-    label.setObjectName("fieldLabel")
-    return label
-
-
-def muted(text: str, parent: QWidget, wrap: bool = False) -> QLabel:
-    label = QLabel(text, parent)
-    label.setObjectName("muted")
-    label.setWordWrap(wrap)
-    return label
-
-
-def divider(parent: QWidget) -> QFrame:
-    line = QFrame(parent)
-    line.setObjectName("divider")
-    return line
-
-
-def align_labels(labels: Iterable[QLabel]) -> None:
-    """Give form labels the same width so the fields next to them line up."""
-    items = list(labels)
-    width = max((label.sizeHint().width() for label in items), default=0)
-    for label in items:
-        label.setMinimumWidth(width)
-
-
-def set_role(widget: QWidget, role: str) -> None:
-    """Tag a widget for variant QSS: ``QPushButton[role="hero"] { … }``.
-    Roles on shared parts are cleared automatically when the variant changes."""
-    widget.setProperty("role", role)
-    repolish(widget)
 
 
 def set_stretch(widget: QWidget, stretch: int) -> bool:

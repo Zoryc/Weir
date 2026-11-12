@@ -1,7 +1,12 @@
-"""Studio: a pro-tool look — numbered monospace sections, a terminal-style prompt,
-an inspector on the right and the queue as a full-width monitor. Graphite + lime.
+"""Weir's design ("Studio"): a pro-tool look with a modern finish.
 
-Looks technical at first glance; the numbers 01 → 04 spell out the path.
+Numbered monospace sections, a terminal-style prompt, an inspector on the right and the
+queue as a full-width monitor; graphite + lime in dark mode, white + lime in light mode.
+It looks technical at first glance, and the numbers 01 → 04 spell out the path.
+
+The window's controls ("parts") are created by MainWindow; ``build`` only arranges them.
+Every part in main_window.REQUIRED_PARTS must be placed. Check the result with
+``python tools/screenshots.py --check``.
 """
 
 from __future__ import annotations
@@ -14,11 +19,11 @@ from PySide6.QtWidgets import QFrame, QLabel, QSizePolicy, QWidget
 
 from core import APP_VERSION
 
-from .. import kit
-from ..theme import GlyphFile, Metrics, Theme, Variant, css_families
+from . import kit
+from .theme import Design, GlyphFile, Metrics, Theme, css_families
 
 if TYPE_CHECKING:
-    from ..main_window import MainWindow
+    from .main_window import MainWindow
 
 MONO: tuple[str, ...] = ("JetBrains Mono", "Cascadia Mono", "Consolas", "DejaVu Sans Mono", "Liberation Mono")
 SANS: tuple[str, ...] = ("Inter", "Segoe UI Variable Text", "Segoe UI", "Noto Sans", "DejaVu Sans")
@@ -251,10 +256,7 @@ QCheckBox::indicator:checked {{ image: url("{glyph('check', t.on_accent)}"); }}
 """
 
 
-VARIANT = Variant(
-    key="studio",
-    name="Studio",
-    description="Pro-tool look: numbered monospace sections, a prompt-style link box, inspector on the right.",
+DESIGN = Design(
     light=LIGHT,
     dark=DARK,
     metrics=METRICS,

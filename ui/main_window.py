@@ -1,8 +1,7 @@
 """The single main window.
 
-Its controls ("parts") are created once and keep their behaviour; the active UI
-variant (ui/variants/) decides how they are arranged and styled, and can be
-switched live from Settings → Appearance.
+The window creates its controls ("parts") and owns all behaviour; ui/design.py
+arranges and styles them.
 """
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ from urllib.parse import urlsplit
 from PySide6.QtCore import QByteArray, QDir, QPoint, QProcess, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QAction,
-    QActionGroup,
     QBrush,
     QCloseEvent,
     QColor,
@@ -33,7 +31,6 @@ from PySide6.QtGui import (
     QShortcut,
 )
 from PySide6.QtWidgets import (
-    QAbstractButton,
     QAbstractItemView,
     QApplication,
     QCheckBox,
@@ -69,8 +66,7 @@ from . import theme
 from .dialogs import DepsDialog, ErrorDetailsDialog, UpdateDialog, show_about
 from .icon import app_icon, glyph_icon
 from .kit import set_stretch
-from .theme import ThemeManager, Variant
-from .variants import available_variants
+from .theme import ThemeManager
 from .widgets import (
     ACCENT_ROLE,
     PROGRESS_ROLE,
@@ -85,7 +81,6 @@ from .widgets import (
     TitleDelegate,
     UrlEdit,
     extract_links,
-    repolish,
 )
 
 COL_TITLE, COL_PRESET, COL_PROGRESS, COL_SPEED, COL_ETA, COL_STATUS = range(6)
@@ -104,7 +99,7 @@ ACTION_LABELS: dict[str, str] = {
     ACTION_UPDATE: "Update yt-dlp",
 }
 
-# Parts every variant layout must place (attribute names on MainWindow).
+# Parts the design's layout must place (attribute names on MainWindow).
 REQUIRED_PARTS: tuple[str, ...] = (
     "title_label", "settings_button",
     "url_edit", "paste_btn", "clear_links_btn",
@@ -116,7 +111,7 @@ REQUIRED_PARTS: tuple[str, ...] = (
     "summary_label", "clear_finished_btn", "queue", "banner",
     "log_toggle", "log_view", "copy_log_btn", "clear_log_btn",
 )
-# Parts a variant may leave out (they are then hidden).
+# Parts the design may leave out (they are then hidden).
 OPTIONAL_PARTS: tuple[str, ...] = ("logo_label", "tagline_label", "preset_hint")
 PART_NAMES: tuple[str, ...] = REQUIRED_PARTS + OPTIONAL_PARTS
 
@@ -156,7 +151,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(760, 560)
         self.setAcceptDrops(True)
 
-        # Parts live here while no layout holds them (and when a variant omits one).
+        # Parts are created here, then the design's layout takes them over.
         self._parking = QWidget(self)
         self._parking.hide()
         self._create_parts()
@@ -176,11 +171,10 @@ class MainWindow(QMainWindow):
         self.statusBar().setSizeGripEnabled(False)
 
         self.tray = self._build_tray()
-        self.apply_variant(theme_manager.variant)
+        self._build_layout()
         self._load_settings_into_ui()
         self._connect_signals()
         theme_manager.changed.connect(self.refresh_theme)
-        theme_manager.variant_changed.connect(self.apply_variant)
         self._restore_geometry()
         self.refresh_theme()
         self._update_deps_button()
@@ -192,7 +186,7 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------- parts
 
     def _create_parts(self) -> None:
-        """Create every control once. Layouts (variants) only arrange and style them."""
+        """Create every control. The design (ui/design.py) only arranges and styles them."""
         p = self._parking
 
         # Identity + settings
@@ -300,6 +294,10 @@ class MainWindow(QMainWindow):
         header.setStretchLastSection(False)
         header.setHighlightSections(False)
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        header.setSectionResizeMode(COL_TITLE, QHeaderView.ResizeMode.Stretch)
+        for column, width in DEFAULT_COLUMN_WIDTHS.items():
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+            self.queue.setColumnWidth(column, width)
         self.banner = ErrorBanner(p)
 
         # Log
@@ -317,36 +315,12 @@ class MainWindow(QMainWindow):
         self.clear_log_btn.setObjectName("flat")
 
         self.parts: dict[str, QWidget] = {name: getattr(self, name) for name in PART_NAMES}
-        self._part_defaults = {
-            name: (
-                widget.minimumSize(),
-                widget.maximumSize(),
-                QSizePolicy(widget.sizePolicy()),
-                widget.contentsMargins(),
-                QSize(widget.iconSize()) if isinstance(widget, QAbstractButton) else None,
-            )
-            for name, widget in self.parts.items()
-        }
-        self._preset_contents_length = self.preset_combo.minimumContentsLength()
         self.set_logo_size(DEFAULT_LOGO_SIZE)
 
     def _build_settings_menu(self) -> QMenu:
         menu = QMenu(self)
         self._add_action(menu, "Update yt-dlp…", self._update_ytdlp)
         self._add_action(menu, "Tools (yt-dlp, ffmpeg, Deno)…", self._show_deps_dialog)
-        appearance = menu.addMenu("Appearance")
-        appearance.setToolTipsVisible(True)
-        group = QActionGroup(self)
-        group.setExclusive(True)
-        self._appearance_actions: dict[str, QAction] = {}
-        for variant in available_variants():
-            action = QAction(variant.name, self)
-            action.setCheckable(True)
-            action.setToolTip(variant.description)
-            action.triggered.connect(lambda _checked=False, v=variant: self._choose_variant(v))
-            group.addAction(action)
-            appearance.addAction(action)
-            self._appearance_actions[variant.key] = action
         menu.addSeparator()
         self._add_action(menu, "Open settings folder", lambda: self._open_path(config_dir()))
         self._add_action(menu, "Open tools folder", lambda: self._open_path(writable_bin_dir()))
@@ -356,77 +330,20 @@ class MainWindow(QMainWindow):
         return menu
 
     def set_logo_size(self, size: int) -> None:
-        """For variants: size of the app icon shown by ``logo_label``."""
+        """For the design: size of the app icon shown by ``logo_label``."""
         self.logo_label.setPixmap(app_icon().pixmap(size, size))
 
-    def _reset_parts(self) -> None:
-        """Undo layout-specific tweaks from the previous variant."""
-        for name, widget in self.parts.items():
-            min_size, max_size, policy, margins, icon_size = self._part_defaults[name]
-            widget.setMinimumSize(min_size)
-            widget.setMaximumSize(max_size)
-            widget.setSizePolicy(policy)
-            widget.setContentsMargins(margins)
-            if icon_size is not None and isinstance(widget, QAbstractButton):
-                widget.setIconSize(icon_size)
-            if widget.property("role") is not None:
-                widget.setProperty("role", None)
-        self.advanced_panel.set_stacked(False)
-        self.preset_combo.setMinimumContentsLength(self._preset_contents_length)
-        self.set_logo_size(DEFAULT_LOGO_SIZE)
-        header = self.queue.header()
-        header.setSectionResizeMode(COL_TITLE, QHeaderView.ResizeMode.Stretch)
-        for column, width in DEFAULT_COLUMN_WIDTHS.items():
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
-            self.queue.setColumnWidth(column, width)
-            self.queue.setColumnHidden(column, False)
-
-    def apply_variant(self, variant: Variant) -> None:
-        """Arrange the parts with the variant's layout. Safe to call at any time."""
-        banner_shown = not self.banner.isHidden()
+    def _build_layout(self) -> None:
+        """Let the design arrange the parts into the page."""
         content = QWidget()
         content.setObjectName("pageContent")
-        self._reset_parts()
-        try:
-            variant.build_layout(self, content)
-        except Exception:  # noqa: BLE001 - a broken variant must not take the app down
-            import traceback
-
-            traceback.print_exc()
-            content.deleteLater()
-            fallback = available_variants()[0]
-            if fallback.key != variant.key:
-                self.theme_manager.set_variant(fallback)  # re-enters via variant_changed…
-                if self._page.widget() is None:  # …unless not connected yet (startup)
-                    self.apply_variant(fallback)
-            return
-
+        self.theme_manager.design.build_layout(self, content)
         for name, widget in self.parts.items():
-            if content.isAncestorOf(widget):
-                widget.setVisible(True)
-            else:
+            if not content.isAncestorOf(widget):
                 if name in REQUIRED_PARTS:
-                    print(f"[variant {variant.key}] part not placed: {name}", file=sys.stderr)
-                widget.setParent(self._parking)
+                    print(f"[design] part not placed: {name}", file=sys.stderr)
                 widget.hide()
-        self.advanced_panel.setVisible(self.advanced_toggle.isChecked())
-        self.log_view.setVisible(self.log_toggle.isChecked())
-        self.banner.setVisible(banner_shown and content.isAncestorOf(self.banner))
-
-        self._page.setWidget(content)  # deletes the previous layout's own widgets
-        for widget in self.parts.values():
-            repolish(widget)
-        self._on_log_toggled(self.log_toggle.isChecked())
-        self.queue.doItemsLayout()
-        action = self._appearance_actions.get(variant.key)
-        if action is not None:
-            action.setChecked(True)
-        self.refresh_theme()
-
-    def _choose_variant(self, variant: Variant) -> None:
-        self.theme_manager.set_variant(variant)  # emits variant_changed -> apply_variant
-        self.settings.ui_variant = variant.key
-        self._schedule_save()
+        self._page.setWidget(content)
 
     def _add_action(self, menu: QMenu, text: str, slot: object) -> QAction:
         action = QAction(text, self)
@@ -452,7 +369,7 @@ class MainWindow(QMainWindow):
         return tray
 
     def refresh_theme(self) -> None:
-        """Re-create theme-coloured icons and repaint the queue (light/dark or variant switch)."""
+        """Re-create theme-coloured icons and repaint the queue (light/dark switch)."""
         t = theme.current()
         m = theme.metrics()
         self.download_btn.setIcon(
@@ -471,9 +388,9 @@ class MainWindow(QMainWindow):
             log_font.setFamilies(list(m.mono_families))
         log_font.setPointSizeF(max(8.0, m.font_size - 0.5))
         self.log_view.setFont(log_font)
-        active = theme.variant()
-        if active is not None and active.after_refresh is not None:
-            active.after_refresh(self, t)
+        design = theme.design()
+        if design is not None and design.after_refresh is not None:
+            design.after_refresh(self, t)
         for job in self.manager.jobs():
             self._update_item(job)
         self.queue.doItemsLayout()
@@ -576,7 +493,6 @@ class MainWindow(QMainWindow):
         s.max_parallel = int(self.parallel_combo.currentData() or 2)
         s.show_advanced = self.advanced_toggle.isChecked()
         s.show_log = self.log_toggle.isChecked()
-        s.ui_variant = self.theme_manager.variant.key
         s.window_geometry = bytes(self.saveGeometry().toBase64().data()).decode("ascii")
         s.save()
 

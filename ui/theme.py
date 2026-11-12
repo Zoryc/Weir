@@ -1,9 +1,9 @@
-"""Design system: colours (Theme), shapes and type (Metrics), and UI variants.
+"""Design system: colours (Theme), shapes and type (Metrics) and the Design that uses them.
 
-A Variant bundles light + dark colours, metrics, extra stylesheet rules and a layout
-function (see ui/variants/). ThemeManager applies the active variant — Fusion style,
-palette, app font and stylesheet — and follows the system light/dark setting unless
-the variant forces one. Fusion is used everywhere so Windows and Linux look the same.
+ui/design.py defines Weir's design: light + dark colours, metrics, extra stylesheet
+rules and the layout function. ThemeManager applies it — Fusion style, palette, app font
+and stylesheet — and follows the system light/dark setting. Fusion is used everywhere so
+Windows and Linux look the same.
 """
 
 from __future__ import annotations
@@ -17,12 +17,14 @@ from PySide6.QtCore import QObject, QStandardPaths, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import QApplication
 
+from core import APP_NAME
+
 from .icon import write_glyph_png
 
 
 @dataclass(frozen=True)
 class Theme:
-    """Colours for one scheme (light or dark) of a variant. All values are #rrggbb."""
+    """Colours for one scheme (light or dark). All values are #rrggbb."""
 
     dark: bool
     window: str  # page background
@@ -59,7 +61,7 @@ class Theme:
 
 @dataclass(frozen=True)
 class Metrics:
-    """Shape, spacing and typography of a variant. Sizes in px unless noted (pt)."""
+    """Shape, spacing and typography. Sizes in px unless noted (pt)."""
 
     font_families: tuple[str, ...] = ()  # body font fallbacks; () = platform UI font
     font_size: float = 10.0  # body size in pt
@@ -86,12 +88,9 @@ GlyphFile = Callable[[str, str], str]  # (glyph name, "#rrggbb") -> PNG path usa
 
 
 @dataclass(frozen=True)
-class Variant:
-    """One complete look of the main window."""
+class Design:
+    """The complete look of the main window."""
 
-    key: str
-    name: str
-    description: str
     light: Theme
     dark: Theme
     build_layout: LayoutBuilder
@@ -103,11 +102,11 @@ class Variant:
 
 _theme: Theme | None = None
 _metrics: Metrics = Metrics()
-_variant: Variant | None = None
+_design: Design | None = None
 
 
 def current() -> Theme:
-    """Colours of the active variant and scheme."""
+    """Colours of the design in the active scheme (light or dark)."""
     assert _theme is not None, "ThemeManager has not been created yet"
     return _theme
 
@@ -116,8 +115,8 @@ def metrics() -> Metrics:
     return _metrics
 
 
-def variant() -> Variant | None:
-    return _variant
+def design() -> Design | None:
+    return _design
 
 
 def build_palette(t: Theme) -> QPalette:
@@ -173,7 +172,7 @@ def tint(color: QColor, alpha: int) -> QColor:
 
 
 def build_stylesheet(t: Theme, m: Metrics, glyphs: dict[str, str]) -> str:
-    """Base stylesheet shared by every variant (variants append their own rules)."""
+    """Base stylesheet (the design appends its own rules)."""
     cv, ch = m.control_padding
     bv, bh = m.button_padding
     pv, ph = m.primary_padding
@@ -333,33 +332,25 @@ _PLATFORM_FONT_CLASSES: tuple[str, ...] = (
 
 
 class ThemeManager(QObject):
-    """Applies the active variant and re-applies it when the system light/dark setting changes."""
+    """Applies the design and re-applies it when the system light/dark setting changes."""
 
-    changed = Signal()  # colours/stylesheet changed (light/dark switch or new variant)
-    variant_changed = Signal(object)  # a different Variant is now active: rebuild the layout
+    changed = Signal()  # colours/stylesheet changed (light/dark switch)
 
-    def __init__(self, app: QApplication, variant: Variant) -> None:
+    def __init__(self, app: QApplication, design: Design) -> None:
         super().__init__(app)
         self._app = app
-        self._variant = variant
+        self._design = design
         self._forced_scheme: str | None = None
         self._system_font = QFont(app.font())
         app.setStyle("Fusion")
         cache = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation)
-        self._cache = Path(cache) if cache else Path.home() / ".cache" / "YtdlpDownloader"
+        self._cache = Path(cache) if cache else Path.home() / ".cache" / APP_NAME
         app.styleHints().colorSchemeChanged.connect(self.apply)
         self.apply()
 
     @property
-    def variant(self) -> Variant:
-        return self._variant
-
-    def set_variant(self, new: Variant) -> None:
-        if new.key == self._variant.key:
-            return
-        self._variant = new
-        self.apply()
-        self.variant_changed.emit(new)
+    def design(self) -> Design:
+        return self._design
 
     def force_scheme(self, scheme: str | None) -> None:
         """Override the system light/dark setting ("light", "dark" or None). Used by tools/tests."""
@@ -367,7 +358,7 @@ class ThemeManager(QObject):
         self.apply()
 
     def is_dark(self) -> bool:
-        scheme = self._variant.scheme or self._forced_scheme
+        scheme = self._design.scheme or self._forced_scheme
         if scheme is not None:
             return scheme == "dark"
         return self._app.styleHints().colorScheme() == Qt.ColorScheme.Dark
@@ -384,11 +375,11 @@ class ThemeManager(QObject):
         return path.as_posix()
 
     def apply(self, *_args: object) -> None:
-        global _theme, _metrics, _variant
-        v = self._variant
-        t = v.dark if self.is_dark() else v.light
-        m = v.metrics
-        _theme, _metrics, _variant = t, m, v
+        global _theme, _metrics, _design
+        d = self._design
+        t = d.dark if self.is_dark() else d.light
+        m = d.metrics
+        _theme, _metrics, _design = t, m, d
 
         self._app.setPalette(build_palette(t))
         glyphs = {
@@ -398,8 +389,8 @@ class ThemeManager(QObject):
             "check_accent": self._glyph_file("check", t.accent),
         }
         qss = build_stylesheet(t, m, glyphs)
-        if v.extra_qss is not None:
-            qss += "\n" + v.extra_qss(t, m, self._glyph_file)
+        if d.extra_qss is not None:
+            qss += "\n" + d.extra_qss(t, m, self._glyph_file)
         self._app.setStyleSheet(qss)
 
         # Fonts last: installing a stylesheet style reloads the platform's per-class fonts

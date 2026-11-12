@@ -44,7 +44,7 @@ def _standard_dir(location: QStandardPaths.StandardLocation, fallback: Path) -> 
 
 
 def config_dir() -> Path:
-    """Per-user settings folder (%LOCALAPPDATA%\\YtdlpDownloader or ~/.config/YtdlpDownloader)."""
+    """Per-user settings folder (%LOCALAPPDATA%\\Weir or ~/.config/Weir)."""
     return _standard_dir(
         QStandardPaths.StandardLocation.AppConfigLocation, Path.home() / ".config" / APP_NAME
     )

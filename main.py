@@ -1,4 +1,4 @@
-"""Ytdlp Downloader — a simple desktop window for yt-dlp.
+"""Weir — a simple desktop window for yt-dlp.
 
 Run from source:  python main.py [links...]
 """
@@ -22,7 +22,7 @@ from core.settings import Settings
 from ui.icon import app_icon
 from ui.main_window import MainWindow
 from ui.theme import ThemeManager
-from ui.variants import get_variant
+from ui.design import DESIGN
 from ui.widgets import extract_links_from_text
 
 
@@ -76,8 +76,8 @@ def main() -> int:
     _install_excepthook()
 
     settings = Settings.load()
-    # Fusion + the chosen UI variant's palette and stylesheet; follows system light/dark.
-    theme = ThemeManager(app, get_variant(settings.ui_variant))
+    # Fusion + Weir's palette and stylesheet; follows the system light/dark setting.
+    theme = ThemeManager(app, DESIGN)
     presets = PresetStore.load()
     deps = DepsManager()
     window = MainWindow(settings, presets, deps, theme)
@@ -87,8 +87,8 @@ def main() -> int:
     window.show()
     deps.refresh()  # version checks run in a background thread
     code = app.exec()
-    # Destroy the window while Python is still fully alive: some UI variants use Python
-    # layout classes that Qt calls into while it tears widgets down.
+    # Destroy the window while Python is still fully alive, so Qt never calls back into
+    # half-torn-down Python objects (event filters, overridden methods) at exit.
     shiboken6.delete(window)
     return code
 

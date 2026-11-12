@@ -1,11 +1,12 @@
 @echo off
-rem Build Ytdlp Downloader for Windows (PyInstaller one-folder build).
+rem Build Weir for Windows (PyInstaller one-folder build): dist\Weir\Weir.exe
 rem Usage: build_windows.bat [--with-bin]
 rem   --with-bin  also copy the local bin\ folder (yt-dlp, ffmpeg, deno) into the build
+rem For the setup.exe installer, run build_installer.bat instead (it calls this script).
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-set "APPNAME=YtdlpDownloader"
+set "APPNAME=Weir"
 set "PY=python"
 where py >nul 2>&1
 if %errorlevel%==0 set "PY=py -3"
@@ -18,18 +19,16 @@ set "VPY=.venv\Scripts\python.exe"
 
 echo Installing build requirements...
 "%VPY%" -m pip install --upgrade pip || goto :error
-"%VPY%" -m pip install -r requirements.txt "pyinstaller>=6.6" pillow || goto :error
+"%VPY%" -m pip install -r requirements.txt "pyinstaller>=6.6" || goto :error
 
-echo Drawing the app icon...
-if not exist build mkdir build
-"%VPY%" -m ui.icon build\icon.png || goto :error
+echo Drawing the logo and installer artwork...
+"%VPY%" -m ui.icon --installer-assets build\installer || goto :error
 
 echo Running PyInstaller...
 "%VPY%" -m PyInstaller --noconfirm --clean --windowed ^
     --name "%APPNAME%" ^
-    --icon build\icon.png ^
+    --icon build\installer\icon.ico ^
     --add-data "presets.json;." ^
-    --collect-submodules ui.variants ^
     main.py || goto :error
 
 rem An editable copy of the presets next to the .exe, and an empty tools folder.
@@ -47,7 +46,6 @@ if /I "%~1"=="--with-bin" (
 
 echo.
 echo Done: dist\%APPNAME%\%APPNAME%.exe
-echo Zip the whole dist\%APPNAME% folder to share it.
 exit /b 0
 
 :error
