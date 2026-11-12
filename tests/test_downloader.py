@@ -64,10 +64,12 @@ def _put(
     status: JobStatus = JobStatus.WAITING,
     audio: bool = False,
     extra_args: list[str] | None = None,
+    playlist: bool = False,
 ) -> DownloadJob:
     """Add a job without starting yt-dlp."""
     options = _options(save_dir)
     options.extra_args = list(extra_args or [])
+    options.playlist = playlist
     job = DownloadJob(id=manager._next_id, url=url, preset=_preset(audio), options=options)
     job.status = status
     manager._next_id += 1
@@ -585,14 +587,14 @@ def test_find_active_works_out_each_link_key_once(
     # Pasting n links checks each against every queued job; parsing all their links on each
     # check took n²/2 parses (seconds for a thousand links, on the UI thread).
     calls = 0
-    real_link_key = downloader._link_key
+    real_parse_link = downloader._parse_link
 
-    def counting_link_key(url: str, keep_list: bool = True) -> str:
+    def counting_parse_link(url: str) -> downloader._Link:
         nonlocal calls
         calls += 1
-        return real_link_key(url, keep_list)
+        return real_parse_link(url)
 
-    monkeypatch.setattr(downloader, "_link_key", counting_link_key)
+    monkeypatch.setattr(downloader, "_parse_link", counting_parse_link)
     folder = str(tmp_path)
     links = [f"https://youtu.be/{index:011d}?si=share{index}" for index in range(300)]
     for link in links:  # what the window does for each pasted link
@@ -603,6 +605,15 @@ def test_find_active_works_out_each_link_key_once(
     for job in list(manager._jobs.values()):  # retrying them all
         assert manager.find_active(job.url, folder, job.preset) == job.id
     assert calls <= 2 * len(links)
+    calls = 0
+    running = next(iter(manager._jobs.values()))
+    running.process = QProcess()
+    try:
+        for job in manager._jobs.values():  # what _schedule asks for each waiting job
+            manager._target_busy(job)
+    finally:
+        running.process = None
+    assert calls == 0, "taking turns reuses the parsed links"
 
 
 @pytest.mark.parametrize(
@@ -643,7 +654,10 @@ def test_find_active_matches_another_share_link_of_the_same_video(
     first = _put(manager, f"https://youtu.be/{VIDEO_ID}?si=AAA", folder)
     assert manager.find_active(f"https://youtu.be/{VIDEO_ID}?si=BBB", folder, _preset()) == first.id
     assert manager.find_active(f"https://www.youtube.com/watch?v={VIDEO_ID}", folder) == first.id
-    assert manager.find_active(f"https://www.youtube.com/watch?v={VIDEO_ID}&list=PL1", folder) is None
+    # Playlist off, a link into a playlist fetches only its video; on, the whole playlist.
+    in_list = f"https://www.youtube.com/watch?v={VIDEO_ID}&list=PL1"
+    assert manager.find_active(in_list, folder) == first.id
+    assert manager.find_active(in_list, folder, playlist=True) is None
     assert manager.find_active("https://youtu.be/aaaaaaaaaaa?si=AAA", folder) is None
 
 
@@ -667,6 +681,188 @@ def test_another_share_link_of_the_same_video_takes_turns(manager: DownloadManag
         assert other.status == JobStatus.ERROR
     finally:
         running.process = None
+
+
+# -- playlists ----------------------------------------------------------------------------
+
+PLAYLIST = "PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf"
+IN_PLAYLIST = f"https://www.youtube.com/watch?v=AAAAAAAAAAA&list={PLAYLIST}"
+
+
+@pytest.mark.parametrize(
+    "again",
+    [
+        IN_PLAYLIST,
+        IN_PLAYLIST + "&si=share2",
+        f"https://youtu.be/AAAAAAAAAAA?list={PLAYLIST}&si=share3",
+    ],
+)
+def test_whole_playlist_is_not_a_duplicate_of_its_video_queued_alone(
+    manager: DownloadManager, tmp_path: Path, again: str
+) -> None:
+    folder = str(tmp_path)
+    alone = _put(manager, IN_PLAYLIST, folder)  # “Download whole playlist” off: video A only
+    assert manager.find_active(again, folder, _preset()) == alone.id
+    assert manager.find_active(again, folder, _preset(), playlist=True) is None, "must be queued"
+    whole = _put(manager, again, folder, playlist=True)
+    assert manager.find_active(IN_PLAYLIST, folder, _preset(), playlist=True) == whole.id
+    assert manager.find_active(IN_PLAYLIST, folder, _preset()) == alone.id
+
+
+def test_what_a_job_fetches_follows_its_playlist_mode(manager: DownloadManager, tmp_path: Path) -> None:
+    folder = str(tmp_path)
+    job = _put(manager, IN_PLAYLIST, folder)
+    assert manager.find_active(IN_PLAYLIST, folder) == job.id
+    job.options.playlist = True  # a retry may bring new options (DownloadManager.retry)
+    assert manager.find_active(IN_PLAYLIST, folder, playlist=True) == job.id
+    assert manager.find_active(IN_PLAYLIST, folder) is None
+
+
+@pytest.mark.parametrize(
+    "same_playlist",
+    [
+        f"https://www.youtube.com/watch?v=BBBBBBBBBBB&list={PLAYLIST}&index=2",
+        f"https://youtu.be/BBBBBBBBBBB?list={PLAYLIST}",
+        f"https://www.youtube.com/playlist?list={PLAYLIST}",
+        f"https://m.youtube.com/playlist?list={PLAYLIST}&si=x",
+        f"https://www.youtube.com/watch?list={PLAYLIST}",
+        f"https://www.youtube.com/embed/videoseries?list={PLAYLIST}",
+    ],
+)
+def test_links_that_fetch_the_same_playlist_are_duplicates(
+    manager: DownloadManager, tmp_path: Path, same_playlist: str
+) -> None:
+    folder = str(tmp_path)
+    whole = _put(manager, IN_PLAYLIST + "&index=1", folder, playlist=True)
+    assert manager.find_active(same_playlist, folder, _preset(), playlist=True) == whole.id
+
+
+def test_links_into_a_playlist_differ_when_they_fetch_something_else(
+    manager: DownloadManager, tmp_path: Path
+) -> None:
+    folder = str(tmp_path)
+    page = f"https://www.youtube.com/playlist?list={PLAYLIST}"
+    whole = _put(manager, page, folder, playlist=True)
+    # A playlist page fetches the whole playlist in either mode.
+    assert manager.find_active(page, folder) == whole.id
+    # Playlist off: only video B, though the playlist has it too (they take turns instead).
+    assert manager.find_active(f"https://youtu.be/BBBBBBBBBBB?list={PLAYLIST}", folder) is None
+    assert manager.find_active("https://youtu.be/BBBBBBBBBBB?list=PLother", folder, playlist=True) is None
+    # A channel's list= picks no playlist: it stays part of that link.
+    assert manager.find_active(f"https://www.youtube.com/@someone?list={PLAYLIST}", folder,
+                               playlist=True) is None
+    # Other sites: the playlist mode may change what a link fetches, so only the same mode matches.
+    show = _put(manager, "https://example.com/show/1", folder)
+    assert manager.find_active("https://example.com/show/1/", folder) == show.id
+    assert manager.find_active("https://example.com/show/1", folder, playlist=True) is None
+
+
+def test_downloads_of_one_playlist_take_turns(manager: DownloadManager, tmp_path: Path) -> None:
+    folder = str(tmp_path)
+    running = _put(manager, IN_PLAYLIST + "&index=1", folder, JobStatus.DOWNLOADING, playlist=True)
+    entry = _put(manager, f"https://www.youtube.com/watch?v=BBBBBBBBBBB&list={PLAYLIST}&index=2",
+                 folder, playlist=True)
+    page = _put(manager, f"https://www.youtube.com/playlist?list={PLAYLIST}", folder, audio=True)
+    one_of_its_videos = _put(manager, f"https://youtu.be/CCCCCCCCCCC?list={PLAYLIST}", folder)
+    other_playlist = _put(manager, "https://www.youtube.com/watch?v=DDDDDDDDDDD&list=PLother",
+                          folder, playlist=True)
+    elsewhere = _put(manager, f"https://www.youtube.com/playlist?list={PLAYLIST}",
+                     str(tmp_path / "other"), playlist=True)
+    running.process = QProcess()
+    try:
+        assert manager._target_busy(entry)
+        assert manager._target_busy(page)
+        assert manager._target_busy(one_of_its_videos)
+        assert not manager._target_busy(other_playlist)
+        assert not manager._target_busy(elsewhere)
+        manager.set_max_parallel(3)  # schedules: yt-dlp is missing, so started jobs fail at once
+        assert entry.status == JobStatus.WAITING, "both would write the playlist's files at once"
+        assert page.status == JobStatus.WAITING
+        assert one_of_its_videos.status == JobStatus.WAITING
+        assert other_playlist.status == JobStatus.ERROR
+        assert elsewhere.status == JobStatus.ERROR
+    finally:
+        running.process = None
+
+
+def test_a_playlist_waits_for_one_of_its_videos(manager: DownloadManager, tmp_path: Path) -> None:
+    folder = str(tmp_path)
+    running = _put(manager, f"https://youtu.be/CCCCCCCCCCC?list={PLAYLIST}", folder,
+                   JobStatus.DOWNLOADING)  # playlist off: video C only
+    page = _put(manager, f"https://www.youtube.com/playlist?list={PLAYLIST}", folder)
+    whole = _put(manager, IN_PLAYLIST, folder, playlist=True)
+    next_video = _put(manager, IN_PLAYLIST, folder, audio=True)  # playlist off: video A only
+    running.process = QProcess()
+    try:
+        assert manager._target_busy(page)
+        assert manager._target_busy(whole)
+        assert not manager._target_busy(next_video), "videos of one playlist download side by side"
+        manager.set_max_parallel(3)
+        assert page.status == JobStatus.WAITING
+        assert whole.status == JobStatus.WAITING
+        assert next_video.status == JobStatus.ERROR
+    finally:
+        running.process = None
+
+
+@pytest.mark.parametrize("kind", ["shorts", "live", "embed"])
+def test_other_video_links_with_a_list_fetch_the_whole_list(
+    manager: DownloadManager, tmp_path: Path, kind: str
+) -> None:
+    # yt-dlp sends these to its playlist extractor, which ignores --no-playlist: even with
+    # the playlist off they fetch the whole list, not the video alone.
+    folder = str(tmp_path)
+    link = f"https://www.youtube.com/{kind}/AAAAAAAAAAA?list={PLAYLIST}"
+    alone = _put(manager, "https://www.youtube.com/watch?v=AAAAAAAAAAA", folder)
+    assert manager.find_active(link, folder, _preset()) is None, "must be queued"
+    _put(manager, f"https://www.youtube.com/{kind}/AAAAAAAAAAA?list=PLother", folder)
+    assert manager.find_active(link, folder, _preset()) is None, "another playlist"
+    whole = _put(manager, f"https://www.youtube.com/playlist?list={PLAYLIST}", folder)
+    assert manager.find_active(link, folder, _preset()) == whole.id
+    assert manager.find_active(link, folder, _preset(), playlist=True) == whole.id
+    # An empty list= names no playlist: the video alone.
+    no_list = f"https://www.youtube.com/{kind}/AAAAAAAAAAA?list="
+    assert manager.find_active(no_list, folder) == alone.id
+
+
+def test_embedded_players_of_one_playlist_take_turns(
+    manager: DownloadManager, tmp_path: Path
+) -> None:
+    folder = str(tmp_path)
+    # The playlist is off for all of them: /embed/, /shorts/ and /live/ still fetch the whole list.
+    running = _put(manager, f"https://www.youtube.com/embed/AAAAAAAAAAA?list={PLAYLIST}", folder,
+                   JobStatus.DOWNLOADING)
+    other_video = _put(manager, f"https://www.youtube.com/embed/BBBBBBBBBBB?list={PLAYLIST}",
+                       folder)
+    shorts = _put(manager, f"https://www.youtube.com/shorts/CCCCCCCCCCC?list={PLAYLIST}", folder,
+                  audio=True)
+    one_of_its_videos = _put(manager, f"https://youtu.be/DDDDDDDDDDD?list={PLAYLIST}", folder)
+    other_playlist = _put(manager, "https://www.youtube.com/live/EEEEEEEEEEE?list=PLother", folder)
+    running.process = QProcess()
+    try:
+        assert manager._target_busy(other_video)
+        assert manager._target_busy(shorts)
+        assert manager._target_busy(one_of_its_videos)
+        assert not manager._target_busy(other_playlist)
+        manager.set_max_parallel(4)  # schedules: yt-dlp is missing, so started jobs fail at once
+        assert other_video.status == JobStatus.WAITING, "both would write the playlist's files"
+        assert shorts.status == JobStatus.WAITING
+        assert one_of_its_videos.status == JobStatus.WAITING
+        assert other_playlist.status == JobStatus.ERROR
+    finally:
+        running.process = None
+
+
+def test_same_link_tells_a_repeat_from_another_link_to_its_playlist(
+    manager: DownloadManager, tmp_path: Path
+) -> None:
+    job = _put(manager, IN_PLAYLIST + "&index=1", str(tmp_path), playlist=True)
+    assert job.same_link(IN_PLAYLIST + "&si=share")
+    assert job.same_link(f"https://youtu.be/AAAAAAAAAAA?list={PLAYLIST}")
+    assert not job.same_link(f"https://www.youtube.com/watch?v=BBBBBBBBBBB&list={PLAYLIST}")
+    assert not job.same_link(f"https://www.youtube.com/playlist?list={PLAYLIST}")
+    page = _put(manager, f"https://www.youtube.com/playlist?list={PLAYLIST}", str(tmp_path))
+    assert page.same_link(f"https://m.youtube.com/playlist?list={PLAYLIST}&si=x")
 
 
 # -- cookies ------------------------------------------------------------------------------

@@ -701,6 +701,99 @@ def test_retry_skips_a_link_that_was_added_again(window: Any) -> None:
     assert window.manager.get(failed).status == JobStatus.WAITING
 
 
+def test_whole_playlist_of_a_video_in_the_list_is_added(window: Any) -> None:
+    alone = "https://www.youtube.com/watch?v=AAAAAAAAAAA&list=PLxyz"
+    window.playlist_check.setChecked(False)
+    window.url_edit.add_links([alone])
+    window._start_downloads()
+
+    whole = "https://youtu.be/AAAAAAAAAAA?list=PLxyz&si=share"
+    window.playlist_check.setChecked(True)
+    window.url_edit.add_links([whole])
+    window._start_downloads()
+    assert [(job.url, job.options.playlist) for job in window.manager.jobs()] == [
+        (alone, False), (whole, True),
+    ]
+    assert window.statusBar().currentMessage() == "Added 1 download to the list."
+    assert window.url_edit.links() == []
+
+    # Another video of that playlist, with the playlist on: the same playlist again.
+    window.url_edit.add_links(["https://www.youtube.com/watch?v=BBBBBBBBBBB&list=PLxyz&index=2"])
+    window._start_downloads()
+    assert len(window.manager.jobs()) == 2
+    assert window.statusBar().currentMessage() == "1 link was for a playlist already in the list."
+
+
+def test_links_into_one_playlist_pasted_together_are_added_once(window: Any) -> None:
+    first = "https://www.youtube.com/watch?v=AAAAAAAAAAA&list=PLxyz&index=1"
+    window.playlist_check.setChecked(True)
+    window.url_edit.add_links([
+        first,
+        "https://www.youtube.com/watch?v=BBBBBBBBBBB&list=PLxyz&index=2",  # another video of it
+        "https://youtu.be/AAAAAAAAAAA?list=PLxyz&si=share",  # the first link again
+    ])
+    window._start_downloads()
+    assert [job.url for job in window.manager.jobs()] == [first]
+    # Only the real repeat counts as "listed twice".
+    assert window.statusBar().currentMessage() == (
+        "Added 1 download to the list. 1 link was listed twice. "
+        "1 link was for a playlist already in the list."
+    )
+
+
+def test_a_shorts_link_with_a_list_is_not_its_video_alone(window: Any) -> None:
+    # yt-dlp fetches the whole list for it even with the playlist off.
+    window.playlist_check.setChecked(False)
+    window.url_edit.add_links(["https://www.youtube.com/watch?v=AAAAAAAAAAA"])
+    window._start_downloads()
+    window.url_edit.add_links(["https://www.youtube.com/shorts/AAAAAAAAAAA?list=PLxyz"])
+    window._start_downloads()
+    assert len(window.manager.jobs()) == 2
+    assert window.statusBar().currentMessage() == "Added 1 download to the list."
+
+
+def test_retry_says_when_its_playlist_is_already_in_the_list(window: Any) -> None:
+    window.playlist_check.setChecked(True)
+    entries = []
+    for link in ("https://www.youtube.com/watch?v=AAAAAAAAAAA&list=PLxyz",
+                 "https://www.youtube.com/watch?v=BBBBBBBBBBB&list=PLxyz"):
+        window.url_edit.add_links([link])
+        window._start_downloads()
+        entries.append(window.manager.jobs()[-1])
+        entries[-1].status = JobStatus.ERROR
+    window.url_edit.add_links(["https://www.youtube.com/playlist?list=PLxyz"])
+    window._start_downloads()  # waiting now: the whole playlist
+    assert len(window.manager.jobs()) == 3
+
+    window._retry_jobs([entries[0].id])
+    assert entries[0].status == JobStatus.ERROR, "no second copy"
+    assert window.statusBar().currentMessage() == (
+        "Not retried: its playlist is already waiting or downloading in the list."
+    )
+    window._retry_jobs([job.id for job in entries])
+    assert window.statusBar().currentMessage() == (
+        "2 downloads weren't retried: their links or playlists are already waiting or "
+        "downloading in the list."
+    )
+
+
+def test_retry_of_a_whole_playlist_is_not_blocked_by_its_video_alone(window: Any) -> None:
+    link = "https://www.youtube.com/watch?v=AAAAAAAAAAA&list=PLxyz"
+    window.playlist_check.setChecked(True)
+    window.url_edit.add_links([link])
+    window._start_downloads()
+    (whole,) = window.manager.jobs()
+    whole.status = JobStatus.ERROR
+    window.playlist_check.setChecked(False)
+    window.url_edit.add_links([link])
+    window._start_downloads()  # waiting now: only video AAAAAAAAAAA
+    assert len(window.manager.jobs()) == 2
+
+    window._retry_jobs([whole.id])
+    assert whole.status == JobStatus.WAITING
+    assert whole.options.playlist, "still the whole playlist"
+
+
 def test_the_same_link_with_another_preset_is_added(window: Any) -> None:
     window.url_edit.add_links([URL])
     window._start_downloads()

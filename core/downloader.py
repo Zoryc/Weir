@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlsplit
 
 from PySide6.QtCore import QObject, QProcess, Signal
@@ -64,6 +65,9 @@ YOUTUBE_ID_RE = re.compile(r"[0-9A-Za-z_-]{11}")
 # /embed/videoseries?list=... is a playlist player and /embed/live_stream?channel=... is a
 # channel's current live stream, so these links fall back to the plain key with list=/channel=.
 YOUTUBE_NOT_IDS = frozenset({"videoseries", "live_stream"})
+# YouTube pages that play the whole list= whatever “Download whole playlist” says (watch?list=
+# without a video too). On other pages without a video (channels) list= is left in the key.
+YOUTUBE_PLAYLIST_PATHS = frozenset({"playlist", "watch", "embed/videoseries"})
 # A #fragment that only gives a start time (vimeo.com/ID#t=10s). Other fragments are kept: on
 # hash-routed sites they pick the song or station (music.163.com/#/song?id=..., radiko.jp/#!/live/QRR).
 TIME_FRAGMENT_RE = re.compile(r"t=(?:npt:)?[0-9hms:.,]*", re.IGNORECASE)
@@ -170,19 +174,31 @@ class DownloadJob:
     used_js_runtime: bool = False
     _buffer: bytes = b""
     _destinations: list[_Destination] = field(default_factory=list)
-    _link_keys: dict[bool, str] = field(default_factory=dict, init=False, repr=False)
+    _link: _Link | None = field(default=None, init=False, repr=False)
 
-    def link_key(self, keep_list: bool = True) -> str:
-        """_link_key(self.url, keep_list), worked out once per job.
+    def link(self) -> _Link:
+        """_parse_link(self.url), worked out once per job.
 
         find_active compares a pasted link with every queued job, once per pasted link;
         parsing all their links every time froze the window when hundreds were pasted.
-        The link of a job never changes, so the key can be kept.
+        The link of a job never changes, so the parsed link can be kept. What it fetches
+        also depends on options.playlist, which a retry may change: that part is not kept.
         """
-        key = self._link_keys.get(keep_list)
-        if key is None:
-            key = self._link_keys[keep_list] = _link_key(self.url, keep_list)
-        return key
+        if self._link is None:
+            self._link = _parse_link(self.url)
+        return self._link
+
+    def fetches(self) -> tuple[str, ...]:
+        """What yt-dlp downloads for this job (see _Link.fetches)."""
+        return self.link().fetches(self.options.playlist)
+
+    def same_link(self, url: str) -> bool:
+        """True if url is this job's link, maybe written another way (another ?si=, youtu.be/ID).
+
+        find_active also matches other links that fetch the same playlist (another of its
+        videos, its playlist page): this tells the window which of the two it found.
+        """
+        return _parse_link(url).key == self.link().key
 
     @property
     def is_active(self) -> bool:
@@ -271,26 +287,76 @@ def _parse_percent(text: str) -> float | None:
         return None
 
 
+class _Link(NamedTuple):
+    """A link taken apart by _parse_link."""
+
+    key: str  # see _parse_link; a YouTube video is "youtube:<video id>", whatever its list=
+    list_id: str  # the YouTube playlist a video or playlist link names with list=, or ""
+    video: bool  # a YouTube link to one video (it may also name a playlist)
+    # yt-dlp downloads all of list_id for this link even with “Download whole playlist” off
+    # (--no-playlist): playlist pages, and video links other than watch?v= and youtu.be.
+    always_list: bool
+
+    def fetched_list(self, playlist: bool) -> str:
+        """The YouTube playlist yt-dlp downloads in full for this link, or "".
+
+        watch?v=X&list=L and youtu.be/X?list=L fetch the whole list only with “Download
+        whole playlist” on (--yes-playlist); other links naming a list always do.
+        """
+        return self.list_id if playlist or self.always_list else ""
+
+    def fetches(self, playlist: bool) -> tuple[str, ...]:
+        """What yt-dlp downloads for this link: the same for links that fetch the same thing.
+
+        Playlist off, watch?v=X&list=L fetches video X, like watch?v=X in either mode;
+        playlist on, it fetches list L, like every other link naming L (/shorts/X?list=L
+        fetches list L in either mode, see always_list). On other sites (and YouTube
+        channel pages) the mode may change what a link fetches in ways a link can't show,
+        so they only match in the same mode: when unsure, links stay different (a wrong
+        match throws a link away as a duplicate).
+        """
+        list_id = self.fetched_list(playlist)
+        if list_id:
+            return ("list", list_id)
+        if self.video:
+            return ("video", self.key)
+        return ("link", self.key, "playlist" if playlist else "single")
+
+
 def _link_key(url: str, keep_list: bool = True) -> str:
-    """A key that is the same for links that download the same thing.
+    """_parse_link as one string: the same for links to the same video or page.
+
+    YouTube's list= is kept on video links (with “Download whole playlist” on,
+    watch?v=X&list=Y fetches the whole playlist) unless keep_list is False.
+    The queue compares what links fetch instead (see _Link.fetches and _may_overlap).
+    """
+    link = _parse_link(url)
+    if keep_list and link.video and link.list_id:
+        return f"{link.key}?list={link.list_id}"
+    return link.key
+
+
+def _parse_link(url: str) -> _Link:
+    """Take a link apart into a key that is the same for links to the same video or page,
+    and the YouTube playlist it names.
 
     Links to one video often differ: a new ?si= on every Share, youtu.be/ID vs watch?v=ID vs
     /shorts/ID, "www." or "m." hosts, a #t= start time or a trailing "/". Two downloads of
     such links into one folder write the same files, so they must be seen as the same link.
-    YouTube's list= is kept (with “Download whole playlist” on, watch?v=X&list=Y fetches the
-    whole playlist) unless keep_list is False. Never raises; odd text is compared as typed.
+    Never raises; odd text is compared as typed.
     When unsure, links stay different: a wrong match throws a link away as a duplicate.
     """
     text = url.strip().rstrip("/")
     link = text
+    as_typed = _Link(text, "", False, False)
     if not SCHEME_RE.match(text):
         if not BARE_HOST_RE.match(text):
-            return text
+            return as_typed
         link = "//" + text  # so urlsplit reads "youtu.be" as the host, not as a path
     try:
         parts = urlsplit(link)
     except ValueError:  # e.g. an unclosed "[" or a host with look-alike Unicode slashes
-        return text
+        return as_typed
     # http, https and no scheme at all fetch the same page and write the same files.
     scheme = parts.scheme.lower()
     if scheme in ("http", "https"):
@@ -307,22 +373,28 @@ def _link_key(url: str, keep_list: bool = True) -> str:
         if p and not _is_tracking_param(p.partition("=")[0])
     ]
     fragment = parts.fragment
+    list_id = ""
     if host in YOUTUBE_HOSTS:
         fragment = ""  # YouTube never puts what to play after "#" (#comments, #t=...)
         video = _youtube_video_id(host, path, params)
+        # yt-dlp plays the first list= (an empty one names no playlist).
+        lists = [p.partition("=")[2] for p in params if p.partition("=")[0] == "list"]
         if video:
             # The other parameters (t=, start=, index=, ...) don't change what yt-dlp downloads.
-            lists = [p.partition("=")[2] for p in params if p.partition("=")[0] == "list"]
-            if keep_list and lists and lists[0]:
-                return f"youtube:{video}?list={lists[0]}"
-            return f"youtube:{video}"
+            # --no-playlist picks the video alone only on watch?v= and youtu.be links: yt-dlp
+            # hands /shorts/, /live/ and /embed/ links with a list= to its playlist extractor.
+            picks_video = host == "youtu.be" or path.strip("/").lower() == "watch"
+            return _Link(f"youtube:{video}", lists[0] if lists else "", True, not picks_video)
+        if lists and path.strip("/").lower() in YOUTUBE_PLAYLIST_PATHS:
+            list_id = lists[0]
     elif TIME_FRAGMENT_RE.fullmatch(fragment):
         fragment = ""
     # Parameter order never changes the page; a stable sort keeps repeated names in order.
     params.sort(key=lambda p: p.partition("=")[0])
     query = f"?{'&'.join(params)}" if params else ""
     fragment = f"#{fragment}" if fragment else ""
-    return f"{scheme}://{userinfo}{at}{host}{path}{query}{fragment}"
+    # A page without a video fetches its whole list= in either mode (if it names one).
+    return _Link(f"{scheme}://{userinfo}{at}{host}{path}{query}{fragment}", list_id, False, True)
 
 
 def _is_tracking_param(name: str) -> bool:
@@ -344,6 +416,21 @@ def _youtube_video_id(host: str, path: str, params: list[str]) -> str:
     if candidate in YOUTUBE_NOT_IDS or not YOUTUBE_ID_RE.fullmatch(candidate):
         return ""
     return candidate
+
+
+def _may_overlap(first: DownloadJob, second: DownloadJob) -> bool:
+    """True if two downloads into one folder may write the same files at the same time.
+
+    That is when they fetch the same video or page (list= aside: watch?v=X&list=L fetches
+    video X too), the same YouTube playlist, or when one fetches a whole playlist and the
+    other's link points into it (its video is one of the playlist's).
+    """
+    a, b = first.link(), second.link()
+    if a.key == b.key:
+        return True
+    a_list = a.fetched_list(first.options.playlist)
+    b_list = b.fetched_list(second.options.playlist)
+    return bool(a_list and a_list == b.list_id or b_list and b_list == a.list_id)
 
 
 def _norm_path(path: str, base: str = "") -> str:
@@ -474,15 +561,19 @@ class DownloadManager(QObject):
     def is_idle(self) -> bool:
         return self.running_count() == 0 and self._pending_cleanups == 0
 
-    def find_active(self, url: str, save_dir: str, preset: Preset | None = None) -> int | None:
-        """Id of a waiting or running download of the same link into the same folder, if any.
+    def find_active(
+        self, url: str, save_dir: str, preset: Preset | None = None, *, playlist: bool = False
+    ) -> int | None:
+        """Id of a waiting or running download of the same thing into the same folder, if any.
 
-        Links count as the same when they lead to the same download (see _link_key), so a
-        second Share link of a video (another ?si=) is caught too.
+        Links count as the same when they fetch the same thing (see _Link.fetches), so a
+        second Share link of a video (another ?si=) is caught too. `playlist` is the
+        “Download whole playlist” mode the link would be downloaded in: with it on, a link
+        into a playlist is the whole playlist, not the same as its video queued alone.
         With a preset, only downloads with the same yt-dlp options count: the same video
         as MP4 and as MP3 is fine (they take turns, see _target_busy).
         """
-        wanted_url = _link_key(url)
+        wanted = _parse_link(url).fetches(playlist)
         wanted_dir = _norm_path(save_dir)
         for job in self._jobs.values():
             running = job.process is not None and not job.cancel_requested
@@ -490,7 +581,7 @@ class DownloadManager(QObject):
                 continue
             if preset is not None and job.preset.args != preset.args:
                 continue
-            if job.link_key() == wanted_url and _norm_path(job.options.save_dir) == wanted_dir:
+            if job.fetches() == wanted and _norm_path(job.options.save_dir) == wanted_dir:
                 return job.id
         return None
 
@@ -565,19 +656,18 @@ class DownloadManager(QObject):
                 self._start(job)
 
     def _target_busy(self, job: DownloadJob) -> bool:
-        """True while another download of the same link into the same folder runs.
+        """True while another download into the same folder runs that may write the same files.
 
         Two presets of one video (MP4 and MP3, say) download the same streams under the
-        same temporary names, so the second one waits for the first to finish. YouTube's
-        list= is ignored here: watch?v=X&list=Y fetches video X too (alone when “Download
-        whole playlist” is off), so it would write X's files at the same time.
+        same temporary names, so the second one waits for the first to finish. See
+        _may_overlap for playlists. A wrong "busy" only delays a start, so when unsure
+        downloads take turns.
         """
-        url = job.link_key(keep_list=False)
         folder = _norm_path(job.options.save_dir)
         return any(
             other is not job
             and other.process is not None
-            and other.link_key(keep_list=False) == url
+            and _may_overlap(job, other)
             and _norm_path(other.options.save_dir) == folder
             for other in self._jobs.values()
         )

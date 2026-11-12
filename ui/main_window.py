@@ -794,17 +794,23 @@ class MainWindow(QMainWindow):
         if preset is None or options is None:
             return
         added_ids: set[int] = set()
-        skipped = twice = 0
+        skipped = twice = in_playlist = 0
         for link in links:
             # Already waiting or downloading into this folder with this preset: a second
             # copy would only fight over the same files.
-            active = self.manager.find_active(link, options.save_dir, preset)
-            if active is not None and active in added_ids:
-                twice += 1  # the same link written twice in the box (e.g. with a slash at the end)
-            elif active is not None:
-                skipped += 1
-            else:
+            active = self.manager.find_active(link, options.save_dir, preset,
+                                              playlist=options.playlist)
+            job = None if active is None else self.manager.get(active)
+            if job is None:
                 added_ids.add(self.manager.add(link, preset, options))
+            elif not job.same_link(link):
+                # Another link to a playlist that is waiting or downloading (another of its
+                # videos, its playlist page): saying it was "listed twice" would be untrue.
+                in_playlist += 1
+            elif job.id in added_ids:
+                twice += 1  # the same link written twice in the box (e.g. with a slash at the end)
+            else:
+                skipped += 1
         added = len(added_ids)
         # Started now: nothing waits for the tools window to start these links any more.
         self._resume_after_install = False
@@ -816,7 +822,11 @@ class MainWindow(QMainWindow):
             parts.append(f"{skipped} link{' was' if skipped == 1 else 's were'} already in the list.")
         if twice:
             parts.append(f"{twice} link{' was' if twice == 1 else 's were'} listed twice.")
-        self.statusBar().showMessage(" ".join(parts), 6000 if skipped or twice else 4000)
+        if in_playlist:
+            parts.append("1 link was for a playlist already in the list." if in_playlist == 1 else
+                         f"{in_playlist} links were for playlists already in the list.")
+        self.statusBar().showMessage(" ".join(parts),
+                                     6000 if skipped or twice or in_playlist else 4000)
         if added:
             QTimer.singleShot(0, self._reveal_queue)  # once the new rows are laid out
 
@@ -879,15 +889,21 @@ class MainWindow(QMainWindow):
         base = self._current_options()
         if base is None:
             return
-        busy = 0
+        busy = in_playlist = 0
         for job_id in job_ids:
             job = self.manager.get(job_id)
             if job is None or job.process is not None or job.status == JobStatus.WAITING:
                 continue
-            if self.manager.find_active(job.url, job.options.save_dir, job.preset) not in (None, job_id):
-                # The same link was added again with this preset and is waiting or downloading
-                # into the same folder: a second copy would only fight over the same files.
+            active = self.manager.find_active(job.url, job.options.save_dir, job.preset,
+                                              playlist=job.options.playlist)
+            other = None if active in (None, job_id) else self.manager.get(active)
+            if other is not None:
+                # The same link (or another link to the same playlist) was added again with
+                # this preset and is waiting or downloading into the same folder: a second
+                # copy would only fight over the same files.
                 busy += 1
+                if not other.same_link(job.url):
+                    in_playlist += 1
                 continue
             # Keep what the job was (link, preset, folder, playlist mode); take the
             # current cookies, speed limit, extra options etc. so fixes apply.
@@ -896,12 +912,14 @@ class MainWindow(QMainWindow):
             if self.banner.job_id == job_id:
                 self.banner.hide()
         if busy:
-            self.statusBar().showMessage(
-                "Not retried: that link is already waiting or downloading in the list."
-                if busy == 1 else
-                f"{busy} downloads weren't retried: their links are already waiting or "
-                "downloading in the list.", 6000,
-            )
+            if busy == 1:
+                what = "its playlist is" if in_playlist else "that link is"
+                message = f"Not retried: {what} already waiting or downloading in the list."
+            else:
+                what = "their links or playlists are" if in_playlist else "their links are"
+                message = (f"{busy} downloads weren't retried: {what} already waiting or "
+                           "downloading in the list.")
+            self.statusBar().showMessage(message, 6000)
 
     def _remove_jobs(self, job_ids: list[int]) -> None:
         for job_id in job_ids:
