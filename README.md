@@ -78,7 +78,8 @@ The window is laid out as four numbered steps:
 | `03` | **Output** | Choose the folder, and whether you want the whole playlist, subtitles or cover art. |
 | `04` | **Run** | Click **Download**. Watch the queue fill up below. |
 
-Right-click a download to open the file or its folder, retry it, or copy an error to ask for help.
+Right-click a download to open the file or its folder, retry it, copy an error to ask for help,
+or remove it from the list, with or without deleting its files (they go to the Recycle Bin).
 
 ### Presets
 

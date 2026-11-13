@@ -8,17 +8,20 @@ themselves.
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QEvent, QObject, QRect, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QProcess, QRect, Qt, Signal
 from PySide6.QtGui import QScreen
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QWidget
 
+import core.trash
 from core.deps import TOOL_KEYS, ToolInfo
+from core.downloader import DownloadManager, JobStatus
 from core.paths import IS_WINDOWS
 from core.settings import Settings
 
@@ -788,3 +791,352 @@ def test_join_names() -> None:
     assert join_names(["yt-dlp"]) == "yt-dlp"
     assert join_names(["ffmpeg", "Deno"]) == "ffmpeg and Deno"
     assert join_names(["yt-dlp", "ffmpeg", "Deno"]) == "yt-dlp, ffmpeg and Deno"
+
+# =========================================================================== delete files
+# "Remove and delete files": which files, asking first, the Recycle Bin, and what's left.
+# Nothing here touches the real Recycle Bin or trash: core.trash is replaced by a fake that
+# moves files into a folder of the test's own.
+
+
+class FakeTrash:
+    """Stands in for the Recycle Bin: "trashed" files go to a folder; some paths refuse."""
+
+    def __init__(self, folder: Path) -> None:
+        self.folder = folder
+        folder.mkdir()
+        self.trashed: list[str] = []
+        self.deleted: list[str] = []
+        self.refuse: set[str] = set()  # the Recycle Bin won't take them (a USB stick, say)
+        self.locked: set[str] = set()  # open in a video player: nothing can delete them
+        self.network: set[str] = set()  # on a network drive: deleted for good, never trashed
+
+    def can_trash(self, path: str) -> bool:
+        return path not in self.network
+
+    def in_use(self, path: str) -> bool:
+        return path in self.locked
+
+    def move_to_trash(self, path: str) -> bool:
+        if path in self.refuse or path in self.locked:
+            return False
+        shutil.move(path, self.folder / Path(path).name)
+        self.trashed.append(path)
+        return True
+
+    def delete_for_good(self, path: str) -> bool:
+        if path in self.locked:
+            return False
+        Path(path).unlink()
+        self.deleted.append(path)
+        return True
+
+
+@pytest.fixture
+def bin_(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeTrash:
+    fake = FakeTrash(tmp_path / "recycle-bin")
+    for name in ("can_trash", "in_use", "move_to_trash", "delete_for_good"):
+        monkeypatch.setattr(core.trash, name, getattr(fake, name))
+    return fake
+
+
+def _finished(win: Any, folder: Path, *names: str, status: JobStatus = JobStatus.DONE) -> int:
+    """A download in the list that finished (or failed) after writing these files."""
+    folder.mkdir(exist_ok=True)
+    options = win._current_options()
+    options.save_dir = str(folder)
+    job_id = DownloadManager.add(win.manager, f"https://example.com/watch?v={len(names)}{names}",
+                                 win._current_preset(), options)
+    job = win.manager.get(job_id)
+    for name in names:
+        (folder / name).write_bytes(b"video")
+        job.files.append(str(folder / name))
+    job.status = status
+    win.manager.job_changed.emit(job_id)
+    return job_id
+
+
+def _ids(win: Any) -> list[int]:
+    return [job.id for job in win.manager.jobs()]
+
+
+# --------------------------------------------------------------------------- deleting
+
+
+def test_files_go_to_the_recycle_bin_and_the_downloads_leave_the_list(
+        make_window, prompts, bin_, tmp_path):
+    win = make_window(real_queue=True)
+    folder = tmp_path / "Downloads"
+    one = _finished(win, folder, "Song.mp3")
+    two = _finished(win, folder, "Clip 1.mp4", "Clip 2.mp4")  # a playlist: two files
+    prompts["answer"] = "Move to"
+
+    win._delete_jobs([one, two])
+
+    shown = prompts["shown"][-1]
+    assert shown["text"] == (f"Move these 3 files to the {core.trash.TRASH_NAME} and remove their "
+                             "downloads from the list?")
+    assert "Clip 2.mp4" in shown["info"]
+    assert sorted(Path(p).name for p in bin_.trashed) == ["Clip 1.mp4", "Clip 2.mp4", "Song.mp3"]
+    assert list(folder.iterdir()) == []
+    assert _ids(win) == []
+    assert win.statusBar().currentMessage() == f"Moved 3 files to the {core.trash.TRASH_NAME}."
+
+
+def test_one_file_is_named_in_the_question(make_window, prompts, bin_, tmp_path):
+    win = make_window(real_queue=True)
+    job = _finished(win, tmp_path / "Downloads", "Me at the zoo [jNQXAC9IVRw].mp4")
+    prompts["answer"] = ESC
+    win._delete_jobs([job])
+    assert prompts["shown"][-1]["text"] == (
+        f"Move “Me at the zoo [jNQXAC9IVRw].mp4” to the {core.trash.TRASH_NAME} and remove its "
+        "download from the list?"
+    )
+
+
+@pytest.mark.parametrize("answer", ["Cancel", ESC])
+def test_saying_no_changes_nothing(make_window, prompts, bin_, tmp_path, answer):
+    win = make_window(real_queue=True)
+    folder = tmp_path / "Downloads"
+    job = _finished(win, folder, "Song.mp3")
+    prompts["answer"] = answer
+    win._delete_jobs([job])
+    assert (folder / "Song.mp3").exists()
+    assert bin_.trashed == []
+    assert _ids(win) == [job]
+
+
+def test_a_file_in_use_keeps_its_download_in_the_list(make_window, prompts, bin_, tmp_path):
+    win = make_window(real_queue=True)
+    folder = tmp_path / "Downloads"
+    playing = _finished(win, folder, "Playing.mp4")
+    other = _finished(win, folder, "Other.mp4")
+    bin_.locked.add(str(folder / "Playing.mp4"))
+    prompts["answer"] = "Move to"
+
+    win._delete_jobs([playing, other])
+
+    assert (folder / "Playing.mp4").exists()
+    assert not (folder / "Other.mp4").exists()
+    assert _ids(win) == [playing]
+    assert len(prompts["shown"]) == 1, "no pointless 'Delete for good?' for a file in use"
+    assert win.statusBar().currentMessage() == (
+        f"Moved 1 file to the {core.trash.TRASH_NAME}. “Playing.mp4” is open in another program: "
+        "close it, then try again. Its download stays in the list."
+    )
+
+
+def test_a_file_the_recycle_bin_refuses_is_deleted_for_good_only_after_asking(
+        make_window, prompts, bin_, tmp_path, monkeypatch):
+    import ui.main_window
+
+    win = make_window(real_queue=True)
+    folder = tmp_path / "USB stick"
+    job = _finished(win, folder, "Song.mp3")
+    bin_.refuse.add(str(folder / "Song.mp3"))
+    prompts["answer"] = "Move to"
+    original = ui.main_window.MainWindow._confirm_delete_for_good
+    asked: list[list[str]] = []
+
+    def confirm(self: Any, paths: list[str]) -> bool:
+        asked.append([Path(p).name for p in paths])
+        prompts["answer"] = "Delete for good"
+        return original(self, paths)
+
+    monkeypatch.setattr(ui.main_window.MainWindow, "_confirm_delete_for_good", confirm)
+    win._delete_jobs([job])
+    assert asked == [["Song.mp3"]]
+    assert prompts["shown"][-1]["text"] == (
+        f"“Song.mp3” can't go to the {core.trash.TRASH_NAME}. Delete it for good?")
+    assert bin_.deleted == [str(folder / "Song.mp3")]
+    assert _ids(win) == []
+    assert win.statusBar().currentMessage() == "Deleted 1 file."
+
+
+def test_saying_no_to_delete_for_good_keeps_the_file(make_window, prompts, bin_, tmp_path,
+                                                     monkeypatch):
+    import ui.main_window
+
+    win = make_window(real_queue=True)
+    folder = tmp_path / "USB stick"
+    job = _finished(win, folder, "Song.mp3")
+    bin_.refuse.add(str(folder / "Song.mp3"))
+    prompts["answer"] = "Move to"
+    monkeypatch.setattr(ui.main_window.MainWindow, "_confirm_delete_for_good",
+                        lambda self, paths: False)
+    win._delete_jobs([job])
+    assert (folder / "Song.mp3").exists()
+    assert _ids(win) == [job]
+    assert win.statusBar().currentMessage() == "Kept “Song.mp3”. Its download stays in the list."
+
+
+def test_two_rows_of_the_same_file_both_leave_the_list(make_window, prompts, bin_, tmp_path):
+    win = make_window(real_queue=True)
+    folder = tmp_path / "Downloads"
+    first = _finished(win, folder, "Song.mp3")
+    again = _finished(win, folder, "Song.mp3")  # saved again: "already downloaded"
+    prompts["answer"] = "Move to"
+    win._delete_jobs([first, again])
+    assert bin_.trashed == [str(folder / "Song.mp3")], "the shared file goes once"
+    assert _ids(win) == []
+    assert prompts["shown"][-1]["text"].startswith("Move “Song.mp3”")
+
+
+def test_files_on_a_network_drive_are_deleted_for_good_after_saying_so(
+        make_window, prompts, bin_, tmp_path):
+    win = make_window(real_queue=True)
+    folder = tmp_path / "Downloads"
+    job = _finished(win, folder, "Song.mp3")
+    bin_.network.add(str(folder / "Song.mp3"))
+    prompts["answer"] = "Delete for good"
+
+    win._delete_jobs([job])
+
+    shown = prompts["shown"][-1]
+    assert shown["text"] == "Delete “Song.mp3” for good and remove its download from the list?"
+    assert "network drive" in shown["info"]
+    assert bin_.deleted == [str(folder / "Song.mp3")] and bin_.trashed == []
+    assert _ids(win) == []
+    assert win.statusBar().currentMessage() == "Deleted 1 file."
+
+
+def test_enter_does_not_delete_for_good(make_window, prompts, bin_, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    win = make_window(real_queue=True)
+    folder = tmp_path / "Downloads"
+    job = _finished(win, folder, "Song.mp3")
+    bin_.network.add(str(folder / "Song.mp3"))
+    defaults: list[str] = []
+
+    def press_enter(box: QMessageBox) -> int:
+        defaults.append(box.defaultButton().text())
+        box.defaultButton().click()
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", press_enter)
+    win._delete_jobs([job])
+    assert defaults == ["Cancel"]
+    assert (folder / "Song.mp3").exists()
+
+
+def test_running_downloads_are_left_alone(make_window, prompts, bin_, tmp_path):
+    win = make_window(real_queue=True)
+    folder = tmp_path / "Downloads"
+    done = _finished(win, folder, "Done.mp4")
+    running = _finished(win, folder, "Part 1.mp4", status=JobStatus.DOWNLOADING)
+    win.manager.get(running).process = QProcess()  # a playlist still downloading
+    prompts["answer"] = "Move to"
+    try:
+        win._delete_jobs([done, running])
+        assert (folder / "Part 1.mp4").exists()
+        assert not (folder / "Done.mp4").exists()
+        assert _ids(win) == [running]
+    finally:
+        win.manager.get(running).process = None
+
+
+def test_files_already_gone_just_say_so(make_window, prompts, bin_, tmp_path):
+    win = make_window(real_queue=True)
+    folder = tmp_path / "Downloads"
+    job = _finished(win, folder, "Song.mp3")
+    (folder / "Song.mp3").unlink()
+    win._delete_jobs([job])
+    assert prompts["shown"] == []
+    assert _ids(win) == [job]
+    assert win.statusBar().currentMessage() == "Those files aren't there any more."
+
+
+def test_a_file_another_download_also_wrote_is_kept(make_window, prompts, bin_, tmp_path):
+    win = make_window(real_queue=True)
+    folder = tmp_path / "Downloads"
+    first = _finished(win, folder, "Song.mp3", "Cover.mp3")
+    again = _finished(win, folder, "Song.mp3")  # the same video saved again: same file
+    assert win.manager.files_on_disk([first]) == {first: [str(folder / "Cover.mp3")]}
+    # Chosen together, each lists the shared file (the window deletes it once).
+    assert win.manager.files_on_disk([first, again]) == {
+        first: [str(folder / "Song.mp3"), str(folder / "Cover.mp3")],
+        again: [str(folder / "Song.mp3")],
+    }
+
+
+def test_a_failed_download_loses_its_unfinished_files_too(make_window, prompts, bin_, tmp_path,
+                                                          monkeypatch):
+    win = make_window(real_queue=True)
+    folder = tmp_path / "Downloads"
+    failed = _finished(win, folder, "Part 1.mp4", status=JobStatus.ERROR)
+    done = _finished(win, folder, "Done.mp4")
+    cleaned: list[tuple[int, bool]] = []
+    monkeypatch.setattr(win.manager, "_start_cleanup",
+                        lambda job, partials_only=False: cleaned.append((job.id, partials_only)))
+    prompts["answer"] = "Move to"
+    win._delete_jobs([failed, done])
+    assert ".part files" in prompts["shown"][-1]["info"]
+    assert cleaned == [(failed, True)], "only the failed one, and only its partial files"
+
+
+def test_a_failed_download_s_cleanup_keeps_everything_but_partial_files(
+        qapp, make_window, prompts, bin_, tmp_path):
+    """The real cleanup, run long after the failure: only yt-dlp's partial files go. A
+    complete video whose conversion failed, and a file the user saved since with the same
+    name, stay."""
+    win = make_window(real_queue=True)
+    folder = tmp_path / "Downloads"
+    job_id = _finished(win, folder, "A [id1].mp4", status=JobStatus.ERROR)
+    job = win.manager.get(job_id)
+    # Item 2 of the playlist: yt-dlp announced it, then its conversion failed.
+    win.manager._handle_line(job, b"[DEST]2|2|" + str(folder / "B [id2].mp4").encode())
+    for name in ("B [id2].mp4", "B [id2].f251.webm.part", "B [id2].mp4.ytdl", "B [id2].pdf"):
+        (folder / name).write_bytes(b"x")
+    job.status = JobStatus.ERROR
+    prompts["answer"] = "Move to"
+
+    win._delete_jobs([job_id])
+    for _ in range(100):
+        if not win.manager._cleanups:
+            break
+        QTest.qWait(20)
+
+    assert sorted(p.name for p in folder.iterdir()) == ["B [id2].mp4", "B [id2].pdf"]
+    assert bin_.trashed == [str(folder / "A [id1].mp4")]
+
+
+# --------------------------------------------------------------------------- the menu
+
+
+def _menu_entries(win: Any, qapp: Any, monkeypatch: pytest.MonkeyPatch, job_id: int) -> dict[str, bool]:
+    """The queue's right-click menu for this row: entry text -> enabled. Never opens it."""
+    import ui.main_window
+
+    entries: dict[str, bool] = {}
+
+    class RecordingMenu(QMenu):
+        # Patching QMenu.exec itself doesn't reach PySide's method: replace the class.
+        def exec(self, *_args: Any) -> None:  # type: ignore[override]
+            entries.update({a.text(): a.isEnabled() for a in self.actions() if a.text()})
+
+    monkeypatch.setattr(ui.main_window, "QMenu", RecordingMenu)
+    item = win._items[job_id]
+    win.queue.setCurrentItem(item)
+    qapp.processEvents()
+    win._show_queue_menu(win.queue.visualItemRect(item).center())
+    return entries
+
+
+def test_menu_offers_to_delete_the_file(qapp, make_window, bin_, tmp_path, monkeypatch):
+    win = make_window(real_queue=True)
+    job = _finished(win, tmp_path / "Downloads", "Song.mp3")
+    entries = _menu_entries(win, qapp, monkeypatch, job)
+    assert entries["Remove"] is True
+    assert entries["Remove and delete file…"] is True
+
+
+def test_menu_counts_a_playlist_s_files(qapp, make_window, bin_, tmp_path, monkeypatch):
+    win = make_window(real_queue=True)
+    job = _finished(win, tmp_path / "Downloads", "Clip 1.mp4", "Clip 2.mp4")
+    assert _menu_entries(win, qapp, monkeypatch, job)["Remove and delete files…"] is True
+
+
+def test_menu_greys_it_out_without_files(qapp, make_window, bin_, tmp_path, monkeypatch):
+    win = make_window(real_queue=True)
+    job = _finished(win, tmp_path / "Downloads", status=JobStatus.ERROR)  # failed before any file
+    assert _menu_entries(win, qapp, monkeypatch, job)["Remove and delete files…"] is False

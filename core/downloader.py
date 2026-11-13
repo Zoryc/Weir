@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -138,6 +139,10 @@ class _CleanupTask:
     finals: list[str]  # normalised paths of the files the cancelled download finished
     protected: list[_Protected]  # other downloads' files when the cleanup started
     protected_paths: dict[str, int]  # normalised path -> id of the download that finished it
+    # Only yt-dlp's partial files (.part, .ytdl, …): for a failed download deleted long after
+    # it stopped, when any other file with its name may be the user's (or a complete video
+    # whose conversion failed), not a leftover.
+    partials_only: bool = False
     _late: list[_Protected] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -489,7 +494,8 @@ def _remove_unfinished(task: _CleanupTask) -> tuple[int, list[int]]:
             if key in final_paths:
                 continue
             partial = _is_partial(name[len(dest.stem):])
-            if not partial and (name in dest.existing or os.path.normcase(dest.stem) in finished_stems):
+            if not partial and (task.partials_only or name in dest.existing
+                                or os.path.normcase(dest.stem) in finished_stems):
                 continue
             owner = task.protected_paths.get(key)
             if owner is None:
@@ -645,6 +651,54 @@ class DownloadManager(QObject):
         for job in list(self._jobs.values()):
             if job.status in FINISHED_STATES and job.process is None:
                 self.remove(job.id)
+
+    # -- deleting what a download wrote ---------------------------------------
+
+    def files_on_disk(self, job_ids: Iterable[int]) -> dict[int, list[str]]:
+        """For "Remove and delete files": the files each stopped download (finished, failed
+        or cancelled) completed that are still there, as full paths.
+
+        Running and waiting downloads are left out, and so is a file that a download in the
+        list but not among job_ids also completed (the same video saved twice into one
+        folder): deleting it would take it from that download too. A file shared by two of
+        job_ids is listed for both.
+        """
+        chosen = set(job_ids)
+        claimed_elsewhere = {
+            _norm_path(name, other.options.save_dir)
+            for other in self._jobs.values() if other.id not in chosen
+            for name in other.files
+        }
+        result: dict[int, list[str]] = {}
+        for job_id in job_ids:
+            job = self._jobs.get(job_id)
+            if job is None or job.process is not None or job.status == JobStatus.WAITING:
+                continue
+            files: list[str] = []
+            seen: set[str] = set()
+            for name in job.files:
+                # A relative name is relative to the save folder; join() keeps an absolute one.
+                path = os.path.abspath(os.path.join(job.options.save_dir, name))
+                key = _norm_path(path)
+                if key in claimed_elsewhere or key in seen or not os.path.isfile(path):
+                    continue
+                seen.add(key)
+                files.append(path)
+            result[job_id] = files
+        return result
+
+    def forget_files(self, paths: Iterable[str]) -> None:
+        """Deleted files no longer need keeping safe from other downloads' cleanup."""
+        for path in paths:
+            self._finished_files.pop(_norm_path(path), None)
+
+    def clean_up_after(self, job_id: int) -> None:
+        """Delete a failed download's partial files (.part, .ytdl…: what Retry would resume
+        from). Nothing else: unlike right after a cancel, any other file with its name may
+        by now be the user's. Other downloads' files are always kept."""
+        job = self._jobs.get(job_id)
+        if job is not None and job.status == JobStatus.ERROR and job.process is None:
+            self._start_cleanup(job, partials_only=True)
 
     # -- scheduling ---------------------------------------------------------
 
@@ -908,8 +962,8 @@ class DownloadManager(QObject):
 
     # -- partial-file cleanup after cancel ---------------------------------
 
-    def _start_cleanup(self, job: DownloadJob) -> None:
-        task = self._prepare_cleanup(job)
+    def _start_cleanup(self, job: DownloadJob, partials_only: bool = False) -> None:
+        task = self._prepare_cleanup(job, partials_only)
         if task is None:
             return
         thread = threading.Thread(
@@ -920,7 +974,7 @@ class DownloadManager(QObject):
         )
         thread.start()
 
-    def _prepare_cleanup(self, job: DownloadJob) -> _CleanupTask | None:
+    def _prepare_cleanup(self, job: DownloadJob, partials_only: bool = False) -> _CleanupTask | None:
         """Snapshot what the cleanup for `job` may look at and what it must keep (UI thread)."""
         if not job._destinations:
             return None
@@ -931,6 +985,7 @@ class DownloadManager(QObject):
             [_norm_path(f, job.options.save_dir) for f in job.files],
             protected,
             protected_paths,
+            partials_only,
         )
         self._cleanups.append(task)
         self._pending_cleanups += 1

@@ -54,7 +54,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core import APP_DISPLAY_NAME
+from core import APP_DISPLAY_NAME, trash
 from core.browsers import (
     browser_label,
     cookies_file_path,
@@ -925,6 +925,165 @@ class MainWindow(QMainWindow):
         for job_id in job_ids:
             self.manager.remove(job_id)
 
+    def _delete_jobs(self, job_ids: list[int]) -> None:
+        """ "Remove and delete files": after asking, move the files of the stopped downloads
+        among job_ids to the Recycle Bin (trash on Linux), then take them off the list.
+
+        A file the Recycle Bin can't take (on a USB stick, say, or bigger than it holds) is
+        deleted for good only after asking again. A download whose file stays (open in a
+        player, say, or kept on purpose) stays in the list."""
+        # Worked out again: a download may have been retried since the menu opened.
+        found = {job_id: paths for job_id, paths in self.manager.files_on_disk(job_ids).items() if paths}
+        # A file two chosen downloads share (the same video saved twice) is deleted once.
+        unique = {os.path.normcase(path): path for files in found.values() for path in files}
+        paths = list(unique.values())
+        if not paths:
+            self.statusBar().showMessage("Those files aren't there any more.", 4000)
+            return
+        failed_downloads = any(
+            (job := self.manager.get(job_id)) is not None and job.status == JobStatus.ERROR
+            for job_id in found
+        )
+        if not self._confirm_delete(paths, failed_downloads):
+            return
+        trashed = deleted = 0
+        no_trash: list[str] = []  # the Recycle Bin or trash refused them
+        in_use: list[str] = []  # Windows: another program has them open
+        failed: list[str] = []  # couldn't be deleted for another reason
+        kept: list[str] = []  # the user chose not to delete them for good
+        for path in paths:
+            if trash.can_trash(path):
+                moved = trash.move_to_trash(path)
+                # Judged by whether the file is gone, not only by what the call returned.
+                if not os.path.exists(path):
+                    trashed += moved
+                elif trash.in_use(path):
+                    in_use.append(path)
+                else:
+                    no_trash.append(path)
+            elif trash.delete_for_good(path):  # a network drive: the user agreed above
+                deleted += 1
+            else:
+                (in_use if trash.in_use(path) else failed).append(path)
+        if no_trash:
+            if self._confirm_delete_for_good(no_trash):
+                for path in no_trash:
+                    if trash.delete_for_good(path):
+                        deleted += 1
+                    else:
+                        (in_use if trash.in_use(path) else failed).append(path)
+            else:
+                kept += no_trash
+        still_there = {os.path.normcase(path) for path in in_use + failed + kept}
+        self.manager.forget_files(path for path in paths if os.path.normcase(path) not in still_there)
+        for job_id, files in found.items():
+            if any(os.path.normcase(path) in still_there for path in files):
+                continue
+            self.manager.clean_up_after(job_id)  # a failed download's partial files
+            self.manager.remove(job_id)
+        self.statusBar().showMessage(
+            self._deleted_message(trashed, deleted, in_use, failed, kept), 10000
+        )
+
+    def _confirm_delete(self, paths: list[str], failed_downloads: bool = False) -> bool:
+        """Ask before deleting; names the files and says where they go."""
+        for_good = [path for path in paths if not trash.can_trash(path)]
+        one = len(paths) == 1
+        box = QMessageBox(self)
+        box.setTextFormat(Qt.TextFormat.PlainText)  # file names can contain anything
+        box.setIcon(QMessageBox.Icon.Warning if for_good else QMessageBox.Icon.Question)
+        box.setWindowTitle("Delete file" if one else "Delete files")
+        what = f"“{Path(paths[0]).name}”" if one else f"these {len(paths)} files"
+        theirs = "its download" if one else "their downloads"
+        if not for_good:
+            box.setText(f"Move {what} to the {trash.TRASH_NAME} and remove {theirs} from the list?")
+            action = f"Move to {trash.TRASH_NAME}"
+        elif len(for_good) == len(paths):
+            box.setText(f"Delete {what} for good and remove {theirs} from the list?")
+            action = "Delete for good"
+        else:
+            box.setText(f"Delete {what} and remove {theirs} from the list?")
+            action = "Delete"
+        details: list[str] = []
+        if not one:
+            names = [Path(path).name for path in paths]
+            details.append("\n".join(names[:8]) + (f"\n…and {len(names) - 8} more" if len(names) > 8 else ""))
+        if for_good:
+            on_network = "It is" if len(for_good) == 1 else f"{len(for_good)} of them are"
+            if one:
+                details.append(f"{on_network} on a network drive, so it can't go to the "
+                               f"{trash.TRASH_NAME}.")
+            else:
+                details.append(f"{on_network} on a network drive and will be deleted for good; "
+                               f"the others go to the {trash.TRASH_NAME}.")
+        if failed_downloads:
+            details.append("The unfinished parts a failed download left (.part files) are "
+                           "deleted too.")
+        box.setInformativeText("\n\n".join(details))
+        confirm = box.addButton(action, QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        # Enter confirms only when everything can be put back from the Recycle Bin.
+        box.setDefaultButton(cancel if for_good else confirm)
+        box.setEscapeButton(cancel)
+        box.exec()
+        return box.clickedButton() is confirm
+
+    def _confirm_delete_for_good(self, paths: list[str]) -> bool:
+        """The Recycle Bin or trash refused these files: ask before deleting them for good."""
+        one = len(paths) == 1
+        box = QMessageBox(self)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Delete for good?")
+        what = f"“{Path(paths[0]).name}”" if one else f"{len(paths)} files"
+        box.setText(f"{what} can't go to the {trash.TRASH_NAME}. Delete "
+                    f"{'it' if one else 'them'} for good?")
+        if IS_WINDOWS:
+            box.setInformativeText("Windows has no Recycle Bin on some drives (a USB stick, for "
+                                   "example) and can't keep files bigger than the Recycle Bin "
+                                   "holds. If you cancel, the file stays where it is.")
+        else:
+            box.setInformativeText("The drive it's on may have no trash (a USB stick, for "
+                                   "example). If you cancel, the file stays where it is.")
+        if not one:
+            box.setDetailedText("\n".join(Path(path).name for path in paths))
+        confirm = box.addButton("Delete for good", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        return box.clickedButton() is confirm
+
+    @staticmethod
+    def _deleted_message(trashed: int, deleted: int, in_use: list[str], failed: list[str],
+                         kept: list[str]) -> str:
+        def files(count: int) -> str:
+            return f"{count} file{'s' if count != 1 else ''}"
+
+        def which(paths: list[str]) -> tuple[str, str, str]:
+            """("“A.mp4”" or "2 files", "it" or "them", "Its download stays" or "Their …")."""
+            if len(paths) == 1:
+                return f"“{Path(paths[0]).name}”", "it", "Its download stays"
+            return files(len(paths)), "them", "Their downloads stay"
+
+        parts: list[str] = []
+        if trashed:
+            parts.append(f"Moved {files(trashed)} to the {trash.TRASH_NAME}.")
+        if deleted:
+            parts.append(f"Deleted {files(deleted)}.")
+        if in_use:
+            name, it, stays = which(in_use)
+            parts.append(f"{name} {'is' if len(in_use) == 1 else 'are'} open in another program: "
+                         f"close it, then try again. {stays} in the list.")
+        if failed:
+            name, it, stays = which(failed)
+            parts.append(f"{name} couldn't be deleted: the drive may be read-only, or you may not "
+                         f"be allowed to delete {it}. {stays} in the list.")
+        if kept:
+            name, it, stays = which(kept)
+            parts.append(f"Kept {name}. {stays} in the list.")
+        return " ".join(parts)
+
     def _selected_job_ids(self) -> list[int]:
         ids: list[int] = []
         for item in self.queue.selectedItems():
@@ -1170,6 +1329,12 @@ class MainWindow(QMainWindow):
             act = self._add_action(menu, "Retry", lambda: self._retry_jobs(retryable))
             act.setEnabled(bool(retryable))
             self._add_action(menu, "Remove", lambda: self._remove_jobs(selected))
+            # Also offered for several rows: it acts on the stopped ones with files on disk.
+            files = self.manager.files_on_disk(selected)
+            count = len({path for paths in files.values() for path in paths})
+            act = self._add_action(menu, "Remove and delete file…" if count == 1 else
+                                   "Remove and delete files…", lambda: self._delete_jobs(selected))
+            act.setEnabled(count > 0)
             menu.addSeparator()
             act = self._add_action(menu, "Copy error", lambda: self._copy_error(job))
             act.setEnabled(job.error is not None)

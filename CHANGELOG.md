@@ -21,6 +21,9 @@ Fixes and smoother first steps.
   1366×768 screen, even with Advanced options open. Advanced options use two columns when
   there is room, and new downloads and error messages scroll into view on smaller windows.
 - Opening Weir again brings the open window to the front and hands it your links.
+- Right-click a download → **Remove and delete files…** to also delete what it downloaded. The
+  files go to the Recycle Bin (or the trash on Linux), after you confirm; Weir asks again before
+  deleting anything for good (files on a network drive or a USB stick).
 
 ## 1.0.0 — 2026-11-12
 
