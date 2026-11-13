@@ -17,7 +17,9 @@ Fixes and smoother first steps.
 - Cancelling a download never deletes another download's files, and no longer shows an error
   on Linux.
 - Tools are only installed if their checksum matches, and Weir checks for free disk space first.
-- On small laptop screens, new downloads and error messages scroll into view.
+- A more compact window: everything, the download list included, fits on a 1280×720 or
+  1366×768 screen, even with Advanced options open. Advanced options use two columns when
+  there is room, and new downloads and error messages scroll into view on smaller windows.
 - Opening Weir again brings the open window to the front and hands it your links.
 
 ## 1.0.0 — 2026-11-12

@@ -30,6 +30,7 @@ from PySide6.QtGui import (
     QKeyEvent,
     QPainter,
     QPaintEvent,
+    QResizeEvent,
     QWheelEvent,
 )
 from PySide6.QtGui import QRegularExpressionValidator
@@ -141,6 +142,11 @@ class UrlEdit(QPlainTextEdit):
     """Multi-line link box. Pasted or dropped links each go on their own line."""
 
     submit = Signal()
+
+    def sizeHint(self) -> QSize:
+        # Ask for no more than the minimum: the box grows into whatever room the window has.
+        # (Qt's default, 192 px, made the page scroll on a 720p screen.)
+        return QSize(super().sizeHint().width(), self.minimumHeight())
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -372,6 +378,11 @@ class QueueView(QTreeWidget):
         super().__init__(parent)
         self.setObjectName("queue")
 
+    def sizeHint(self) -> QSize:
+        # Ask for no more than the minimum: the list grows into whatever room the window has.
+        # (Qt's default, 192 px, made the page scroll on a 720p screen.)
+        return QSize(super().sizeHint().width(), self.minimumHeight())
+
     def paintEvent(self, event: QPaintEvent) -> None:
         super().paintEvent(event)
         if self.topLevelItemCount() > 0:
@@ -554,11 +565,10 @@ class AdvancedPanel(QWidget):
         self.delete_preset_btn.setObjectName("flat")
 
         self.rate_edit.setMaximumWidth(150)
-        grid = QGridLayout(self)
-        grid.setContentsMargins(0, 6, 0, 2)
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(8)
-        grid.setColumnStretch(1, 1)
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 4, 0, 0)
+        self._grid.setHorizontalSpacing(12)
+        self._grid.setVerticalSpacing(6)
         rows: list[tuple[str, list[QWidget | int | None | tuple[QWidget, int]]]] = [
             ("Extra options", [self.extra_args_edit]),
             ("File name", [self.template_edit, self.template_reset_btn]),
@@ -567,10 +577,57 @@ class AdvancedPanel(QWidget):
                              self.parallel_combo, None]),
             ("", [self.save_preset_btn, self.delete_preset_btn, None]),
         ]
-        for index, (label, items) in enumerate(rows):
-            if label:
-                grid.addWidget(self._field_label(label), index, 0)
-            grid.addLayout(self._row(items), index, 1)
+        # Each row is one widget, so the rows can be laid out again in one or two columns.
+        self._rows: list[tuple[QLabel | None, QWidget]] = []
+        for label, items in rows:
+            row = QWidget(self)
+            row.setLayout(self._row(items))
+            self._rows.append((self._field_label(label) if label else None, row))
+        self._columns = 0
+        self._arrange(1)
+
+    # -- layout ----------------------------------------------------------------
+
+    # From this width on the fields take two columns, which halves the panel's height and
+    # keeps the queue in view on a small screen (a 1280x720 one, say, once maximised).
+    TWO_COLUMNS_WIDTH = 760
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._arrange(2 if event.size().width() >= self.TWO_COLUMNS_WIDTH else 1)
+
+    @property
+    def columns(self) -> int:
+        return self._columns
+
+    def _arrange(self, columns: int) -> None:
+        """One column: a label and its field on each line. Two: two fields per line, and
+        the preset buttons on a line of their own."""
+        if columns == self._columns:
+            return
+        self._columns = columns
+        grid = self._grid
+        while grid.count():
+            grid.takeAt(0)
+        for column in range(4):
+            grid.setColumnStretch(column, 0)
+            grid.setColumnMinimumWidth(column, 0)
+        if columns == 1:
+            grid.setColumnStretch(1, 1)
+            for index, (label, row) in enumerate(self._rows):
+                if label is not None:
+                    grid.addWidget(label, index, 0)
+                grid.addWidget(row, index, 1)
+            return
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        fields, presets = self._rows[:-1], self._rows[-1][1]
+        for index, (label, row) in enumerate(fields):
+            line, column = divmod(index, 2)
+            if label is not None:
+                grid.addWidget(label, line, column * 2)
+            grid.addWidget(row, line, column * 2 + 1)
+        grid.addWidget(presets, (len(fields) + 1) // 2, 1, 1, 3)
 
     # -- cookies --------------------------------------------------------------
 

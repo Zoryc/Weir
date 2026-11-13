@@ -215,8 +215,11 @@ def _row_in_view(win: Any, index: int) -> bool:
 
 
 def _tall_page(qapp: QApplication, win: Any) -> None:
-    """A short window with Advanced open: the queue's rows start below the visible area."""
+    """A short window with a page taller than it: the queue's rows start below the visible
+    area. The layout fits a 1280x600 window by itself now, so a tall link box (as if the
+    user had enlarged it, or a large font) stands in for whatever makes a page overflow."""
     win.advanced_toggle.setChecked(True)
+    win.url_edit.setMinimumHeight(360)
     win.resize(*SHORT)
     _settle(qapp)
     win._page.verticalScrollBar().setValue(0)

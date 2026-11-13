@@ -91,13 +91,13 @@ METRICS = Metrics(
     card_radius=8,
     control_radius=5,
     primary_radius=6,
-    control_padding=(5, 8),
-    button_padding=(5, 12),
-    primary_padding=(10, 22),
+    control_padding=(4, 8),
+    button_padding=(4, 12),
+    primary_padding=(8, 18),
     primary_font_size=10.0,
     indicator_size=14,
     scrollbar_width=9,
-    row_extra=16,
+    row_extra=12,
 )
 
 
@@ -139,7 +139,9 @@ def _keys(parent: QWidget) -> kit.QHBoxLayout:
 
 
 def build(w: MainWindow, content: QWidget) -> None:
-    root = kit.vbox(spacing=12, margins=(16, 12, 16, 8))
+    # Sized for small screens: on a 1280x720 or 1366x768 screen the whole window, the queue
+    # and its error message included, fits without scrolling, with Advanced options open too.
+    root = kit.vbox(spacing=8, margins=(14, 6, 14, 6))
     content.setLayout(root)
 
     # Top bar: identity, version chip, keyboard legend, settings
@@ -152,7 +154,7 @@ def build(w: MainWindow, content: QWidget) -> None:
 
     # Top row: 01 Source (left, wide)  |  inspector 02 Format · 03 Output · 04 Run (right)
     source = _panel(content)
-    slay = kit.vbox(spacing=10, margins=(14, 12, 14, 12))
+    slay = kit.vbox(spacing=8, margins=(14, 10, 14, 10))
     source.setLayout(slay)
     slay.addLayout(_section("01", "Source", source, w.clear_links_btn, w.paste_btn))
     prompt = _mono_label("›", source, "prompt")
@@ -162,50 +164,60 @@ def build(w: MainWindow, content: QWidget) -> None:
     # row short on a small laptop screen, so the queue below stays in view.
     w.url_edit.setMinimumHeight(64)
     slay.addLayout(kit.hbox(prompt, (w.url_edit, 1), spacing=6), 1)
+    # The Advanced options toggle and the list of sites share one line.
     hint = _mono_label("YouTube, Vimeo, SoundCloud, Twitch… and 1,800+ other sites", source, "hint")
     hint.setWordWrap(True)
-    slay.addLayout(kit.hbox(24, (hint, 1)))
-    slay.addLayout(kit.hbox(18, w.advanced_toggle, None))
+    hint.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    slay.addLayout(kit.hbox(18, w.advanced_toggle, 12, (hint, 1)))
     slay.addWidget(w.advanced_panel)
 
     inspector = _panel(content, "inspector")
     inspector.setFixedWidth(318)
     # Kept compact: the inspector sets the height of the top row, and every pixel it saves
     # keeps the queue and its error message in view on a small laptop screen.
-    ilay = kit.vbox(spacing=6, margins=(14, 12, 14, 12))
+    ilay = kit.vbox(spacing=6, margins=(14, 10, 14, 10))
     inspector.setLayout(ilay)
     w.preset_combo.setMinimumContentsLength(18)
     ilay.addLayout(_section("02", "Format", inspector))
     ilay.addWidget(w.preset_combo)
     ilay.addWidget(w.preset_hint)
-    ilay.addSpacing(4)
-    ilay.addLayout(_section("03", "Output", inspector))
-    ilay.addWidget(w.folder_edit)
-    ilay.addLayout(kit.hbox((w.browse_btn, 1), (w.open_folder_btn, 1), spacing=6))
     ilay.addSpacing(2)
+    # Open and Browse… sit on the section's line, like Clear and Paste in 01 Source: the
+    # main action keeps a button's outline, so it is not missed.
+    w.open_folder_btn.setObjectName("flat")
+    for button in (w.browse_btn, w.open_folder_btn):
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+    ilay.addLayout(_section("03", "Output", inspector, w.open_folder_btn, w.browse_btn))
+    ilay.addWidget(w.folder_edit)
     for check in (w.playlist_check, w.subs_check, w.meta_check):
         ilay.addWidget(check)
-    ilay.addSpacing(4)
+    ilay.addSpacing(2)
     ilay.addLayout(_section("04", "Run", inspector))
     w.download_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-    ilay.addWidget(w.download_btn)
-    ilay.addWidget(w.cancel_btn)
+    # Cancel all next to Download, as tall as it.
+    w.cancel_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+    ilay.addLayout(kit.hbox((w.download_btn, 1), w.cancel_btn, spacing=6))
     ilay.addStretch(1)
 
-    root.addLayout(kit.hbox((source, 1), inspector, spacing=12))
+    root.addLayout(kit.hbox((source, 1), inspector, spacing=10))
 
     # Queue monitor (full width)
     monitor = _panel(content)
-    mlay = kit.vbox(spacing=8, margins=(14, 12, 14, 10))
+    mlay = kit.vbox(spacing=6, margins=(14, 6, 14, 6))
     monitor.setLayout(mlay)
-    mlay.addLayout(_section("●", "Queue", monitor, w.summary_label, 8, w.clear_finished_btn))
+    # The Log toggle sits on the Queue line; its Copy/Clear buttons show only with the log.
+    mlay.addLayout(_section("●", "Queue", monitor, w.summary_label, 8, w.log_toggle, w.clear_finished_btn))
     for column, width in ((1, 150), (2, 140), (3, 86), (4, 58), (5, 124)):
         w.queue.setColumnWidth(column, width)
     # A failed download's message and its one-click fix sit right under the Queue header,
     # above the list, so a short window doesn't hide them below its bottom edge.
     mlay.addWidget(w.banner)
     mlay.addWidget(w.queue, 3)
-    mlay.addLayout(kit.hbox(w.log_toggle, None, w.copy_log_btn, w.clear_log_btn))
+    log_tools = QWidget(monitor)
+    log_tools.setLayout(kit.hbox(None, w.copy_log_btn, w.clear_log_btn))
+    log_tools.setVisible(w.log_toggle.isChecked())
+    w.log_toggle.toggled.connect(log_tools.setVisible)
+    mlay.addWidget(log_tools)
     mlay.addWidget(w.log_view, 2)
     root.addWidget(monitor, 1)
 
@@ -244,11 +256,13 @@ QPlainTextEdit#links {{
 QPlainTextEdit#links:focus {{ border-color: {t.accent}; background: {t.card}; }}
 QPlainTextEdit#log {{ font-family: {mono}; }}
 
-QPushButton#primary {{ font-family: {mono}; font-weight: 700; padding: 11px 18px; }}
+QPushButton#primary {{ font-family: {mono}; font-weight: 700; padding: 8px 14px; }}
 QPushButton#secondary {{
     font-family: {mono}; font-size: 9pt; padding: 6px 12px; background: transparent;
     border: 1px solid {t.border_strong};
 }}
+QFrame#inspector QPushButton#flat {{ padding: 3px 6px; }}
+QStatusBar QPushButton#flat {{ padding: 1px 8px; }}
 QPushButton#secondary:hover {{ border-color: {t.danger}; color: {t.danger}; background: transparent; }}
 QPushButton#secondary:disabled {{ border-color: {t.border}; color: {t.border_strong}; }}
 QPushButton#flat:hover {{ color: {accent_text}; }}
